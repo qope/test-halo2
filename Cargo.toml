@@ -1,0 +1,29 @@
+[package]
+name = "test-halo2"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+halo2-base = { git="https://github.com/qope/halo2-lib", branch = "0.2.2", default-features=false,  features = [
+    "halo2-pse",
+    "display",
+]}
+halo2-ecc = { git="https://github.com/qope/halo2-lib" , branch = "0.2.2", default-features=false,  features = [
+    "halo2-pse",
+    "display",
+]}
+num-bigint = { version = "0.4.3", features = ["rand"] }
+num-traits = "0.2.15"
+poseidon-circuit = {path="../poseidon-circuit"}
+rand = "0.8.5"
+ark-std = { version = "0.4.0", features = ["print-trace"] }
+ethereum-types = { version = "0.14", default-features = false, features = [
+    "std",
+] }
+itertools = "0.10.3"
+
+
+
+
