@@ -16,7 +16,7 @@ halo2-ecc = { git="https://github.com/qope/halo2-lib" , branch = "0.2.2", defaul
 ]}
 num-bigint = { version = "0.4.3", features = ["rand"] }
 num-traits = "0.2.15"
-poseidon-circuit = {path="../poseidon-circuit"}
+poseidon-circuit = {git ="https://github.com/qope/poseidon-circuit"}
 rand = "0.8.5"
 ark-std = { version = "0.4.0", features = ["print-trace"] }
 ethereum-types = { version = "0.14", default-features = false, features = [
