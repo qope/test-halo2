@@ -1,4 +1,4 @@
-use std::{cell::RefCell, marker::PhantomData};
+use std::cell::RefCell;
 
 use halo2_base::{
     gates::{
@@ -6,18 +6,16 @@ use halo2_base::{
         GateInstructions,
     },
     halo2_proofs::{
-        circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
+        circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
         halo2curves::bn256::Fr,
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     },
-    AssignedValue, Context, ContextParams,
+    Context, ContextParams,
 };
 use poseidon_circuit::poseidon::{
-    primitives::{ConstantLength, P128Pow5T3, Spec},
+    primitives::{ConstantLength, P128Pow5T3},
     Hash, Pow5Chip, Pow5Config,
 };
-
-use crate::merkle_tree::usize_to_vec;
 
 const WIDTH: usize = 3;
 const RATE: usize = 2;
@@ -28,6 +26,7 @@ const K: usize = 17;
 struct MyConfig {
     poseidon: Pow5Config<Fr, WIDTH, RATE>,
     a: Column<Advice>,
+    gate: FlexGateConfig<Fr>,
 }
 
 struct MyCircuit;
@@ -60,20 +59,27 @@ impl Circuit<Fr> for MyCircuit {
         let a = meta.advice_column();
         meta.enable_equality(a);
 
-        Self::Config { poseidon, a }
+        let gate = FlexGateConfig::configure(meta, GateStrategy::Vertical, &[1], 1, 0, K);
+
+        Self::Config { poseidon, a, gate }
     }
 
     fn synthesize(&self, config: MyConfig, mut layouter: impl Layouter<Fr>) -> Result<(), Error> {
         let chip = Pow5Chip::construct(config.poseidon.clone());
         let a = config.a;
+        let gate = config.gate;
 
         let input_val0 = assign_val(layouter.namespace(|| "assign 0"), a, Fr::one())?;
         let input_val1 = assign_val(layouter.namespace(|| "assign 1"), a, Fr::zero())?;
+        let index = assign_val(layouter.namespace(|| "lr bit"), a, Fr::from(2))?;
 
-        let hashed = hash_circuit(
+        let hashed = calc_merkle_root(
             layouter.namespace(|| "hash"),
             chip,
+            gate,
+            vec![input_val0.clone(), input_val1.clone()],
             [input_val0, input_val1],
+            index,
         )?;
 
         dbg!(hashed);
@@ -95,13 +101,6 @@ fn hash_circuit(
     Ok(output)
 }
 
-fn select(ctx: &mut Context<Fr>, gate: FlexGateConfig<Fr>) {
-    let a = gate.load_constant(ctx, Fr::one());
-    let a_cell = a.cell;
-
-    // let a_assigend: AssignedCell<Fr, Fr> = a_cell.into();
-}
-
 fn assign_val(
     mut layouter: impl Layouter<Fr>,
     column: Column<Advice>,
@@ -120,23 +119,139 @@ fn assign_val(
     Ok(a_value)
 }
 
+fn calc_merkle_root_level(
+    mut layouter: impl Layouter<Fr>,
+    chip: Pow5Chip<Fr, WIDTH, RATE>,
+    gate: FlexGateConfig<Fr>,
+    sibling: AssignedCell<Fr, Fr>,
+    child: AssignedCell<Fr, Fr>,
+    lr_bit: AssignedCell<Fr, Fr>,
+) -> Result<AssignedCell<Fr, Fr>, Error> {
+    let fixed_columns = gate.constants.clone();
+
+    let left = RefCell::new(None);
+    let right = RefCell::new(None);
+    let new_child = RefCell::new(None);
+    let new_sibling = RefCell::new(None);
+    let new_lr_bit = RefCell::new(None);
+    layouter.assign_region(
+        || "a",
+        |region| {
+            let mut ctx = Context::new(
+                region,
+                ContextParams {
+                    max_rows: 1 << K,
+                    num_context_ids: 1,
+                    fixed_columns: fixed_columns.clone(),
+                },
+            );
+
+            let tmp_child =
+                gate.load_witness(&mut ctx, child.value().and_then(|v| Value::known(*v)));
+            *new_child.borrow_mut() = Some(tmp_child.clone());
+            let tmp_sibling =
+                gate.load_witness(&mut ctx, sibling.value().and_then(|v| Value::known(*v)));
+            *new_sibling.borrow_mut() = Some(tmp_sibling.clone());
+            let tmp_lr_bit =
+                gate.load_witness(&mut ctx, lr_bit.value().and_then(|v| Value::known(*v)));
+            *new_lr_bit.borrow_mut() = Some(tmp_lr_bit.clone());
+
+            // XXX: AssignedCell -> AssignedValue
+            let child = halo2_base::QuantumCell::Existing(&tmp_child);
+            let sibling = halo2_base::QuantumCell::Existing(&tmp_sibling);
+            let lr_bit = halo2_base::QuantumCell::Existing(&tmp_lr_bit);
+            *left.borrow_mut() =
+                Some(gate.select(&mut ctx, child.clone(), sibling.clone(), lr_bit.clone()));
+            *right.borrow_mut() = Some(gate.select(&mut ctx, sibling, child, lr_bit));
+
+            Ok(())
+        },
+    )?;
+
+    layouter.assign_region(
+        || "a",
+        |mut region| {
+            region.constrain_equal(new_child.clone().into_inner().unwrap().cell(), child.cell())?;
+            region.constrain_equal(
+                new_sibling.clone().into_inner().unwrap().cell(),
+                sibling.cell(),
+            )?;
+            region.constrain_equal(
+                new_lr_bit.clone().into_inner().unwrap().cell(),
+                lr_bit.cell(),
+            )?;
+
+            Ok(())
+        },
+    )?;
+
+    let left_assigned_value = left.into_inner().unwrap();
+    let right_assigned_value = right.into_inner().unwrap();
+    let left = AssignedCell::new(left_assigned_value.value, left_assigned_value.cell());
+    let right = AssignedCell::new(right_assigned_value.value, right_assigned_value.cell());
+    let parent = hash_circuit(layouter.namespace(|| "right"), chip, [left, right])?;
+
+    Ok(parent)
+}
+
 fn calc_merkle_root(
     mut layouter: impl Layouter<Fr>,
     chip: Pow5Chip<Fr, WIDTH, RATE>,
+    gate: FlexGateConfig<Fr>,
     siblings: Vec<AssignedCell<Fr, Fr>>,
     leaf: [AssignedCell<Fr, Fr>; 2],
-    index: usize,
+    index: AssignedCell<Fr, Fr>,
 ) -> Result<AssignedCell<Fr, Fr>, Error> {
-    let mut path = usize_to_vec(index, siblings.len());
-    path.reverse();
+    let fixed_columns = gate.constants.clone();
+
+    let mut new_path = vec![];
+    let new_index = RefCell::new(None);
+
+    layouter.assign_region(
+        || "a",
+        |region| {
+            let mut ctx = Context::new(
+                region,
+                ContextParams {
+                    max_rows: 1 << K,
+                    num_context_ids: 1,
+                    fixed_columns: fixed_columns.clone(),
+                },
+            );
+
+            let tmp_index =
+                gate.load_witness(&mut ctx, index.value().and_then(|v| Value::known(*v)));
+            *new_index.borrow_mut() = Some(tmp_index.clone());
+
+            let path = gate.num_to_bits(&mut ctx, &tmp_index, siblings.len());
+            for bit in path.into_iter().rev() {
+                new_path.push(bit);
+            }
+
+            Ok(())
+        },
+    )?;
+
+    layouter.assign_region(
+        || "copy index",
+        |mut region| {
+            region.constrain_equal(new_index.clone().into_inner().unwrap().cell(), index.cell())?;
+
+            Ok(())
+        },
+    )?;
 
     let mut h = hash_circuit(layouter.namespace(|| "hash"), chip.clone(), leaf)?;
     for (i, s) in siblings.iter().enumerate() {
-        if path[i] {
-            h = hash_circuit(layouter.namespace(|| "right"), chip.clone(), [s.clone(), h])?;
-        } else {
-            h = hash_circuit(layouter.namespace(|| "left"), chip.clone(), [h, s.clone()])?;
-        }
+        let lr_bit = AssignedCell::new(new_path[i].value, new_path[i].cell());
+        h = calc_merkle_root_level(
+            layouter.namespace(|| format!("level {i}")),
+            chip.clone(),
+            gate.clone(),
+            s.clone(),
+            h,
+            lr_bit,
+        )?;
     }
     Ok(h)
 }

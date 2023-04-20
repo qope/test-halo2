@@ -23,7 +23,4 @@ ethereum-types = { version = "0.14", default-features = false, features = [
     "std",
 ] }
 itertools = "0.10.3"
-
-
-
-
+hex = "0.4.3"

@@ -161,6 +161,22 @@ mod tests {
     use rand::Rng;
 
     #[test]
+    fn test_calc_merkle_root() {
+        let input0 = Fr::one();
+        let input1 = Fr::zero();
+        let proof = vec![input0, input1];
+        let leaf = [input0, input1];
+        let index = 2;
+        let new_root = calc_merkle_root(index, leaf, proof);
+        let mut new_root_bytes = new_root.to_bytes();
+        new_root_bytes.reverse();
+        assert_eq!(
+            hex::encode(new_root_bytes),
+            "23caa5cc15e79f42039db5057260ad32e0b21318ef641ef7713666c7d47c4d30"
+        );
+    }
+
+    #[test]
     fn test_merkle_tree() {
         let mut rng = rand::thread_rng();
         let height = 32;
