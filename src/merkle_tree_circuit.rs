@@ -10,26 +10,26 @@ use halo2_base::{
         halo2curves::bn256::Fr,
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     },
-    Context, ContextParams,
+    Context, ContextParams, QuantumCell,
 };
 use poseidon_circuit::poseidon::{
     primitives::{ConstantLength, P128Pow5T3},
     Hash, Pow5Chip, Pow5Config,
 };
 
-const WIDTH: usize = 3;
-const RATE: usize = 2;
-const L: usize = 2;
-const K: usize = 17;
+pub const WIDTH: usize = 3;
+pub const RATE: usize = 2;
+pub const L: usize = 2;
+pub const K: usize = 17;
 
 #[derive(Clone)]
-struct MyConfig {
+pub struct MyConfig {
     poseidon: Pow5Config<Fr, WIDTH, RATE>,
     a: Column<Advice>,
     gate: FlexGateConfig<Fr>,
 }
 
-struct MyCircuit;
+pub struct MyCircuit;
 
 impl Circuit<Fr> for MyCircuit {
     type Config = MyConfig;
@@ -88,7 +88,7 @@ impl Circuit<Fr> for MyCircuit {
     }
 }
 
-fn hash_circuit(
+pub fn hash_circuit(
     mut layouter: impl Layouter<Fr>,
     chip: Pow5Chip<Fr, WIDTH, RATE>,
     input: [AssignedCell<Fr, Fr>; L],
@@ -101,7 +101,7 @@ fn hash_circuit(
     Ok(output)
 }
 
-fn assign_val(
+pub fn assign_val(
     mut layouter: impl Layouter<Fr>,
     column: Column<Advice>,
     val: Fr,
@@ -119,7 +119,7 @@ fn assign_val(
     Ok(a_value)
 }
 
-fn calc_merkle_root_level(
+pub fn merkle_level(
     mut layouter: impl Layouter<Fr>,
     chip: Pow5Chip<Fr, WIDTH, RATE>,
     gate: FlexGateConfig<Fr>,
@@ -127,13 +127,12 @@ fn calc_merkle_root_level(
     child: AssignedCell<Fr, Fr>,
     lr_bit: AssignedCell<Fr, Fr>,
 ) -> Result<AssignedCell<Fr, Fr>, Error> {
-    let fixed_columns = gate.constants.clone();
-
     let left = RefCell::new(None);
     let right = RefCell::new(None);
     let new_child = RefCell::new(None);
     let new_sibling = RefCell::new(None);
     let new_lr_bit = RefCell::new(None);
+
     layouter.assign_region(
         || "a",
         |region| {
@@ -142,7 +141,7 @@ fn calc_merkle_root_level(
                 ContextParams {
                     max_rows: 1 << K,
                     num_context_ids: 1,
-                    fixed_columns: fixed_columns.clone(),
+                    fixed_columns: gate.constants.clone(),
                 },
             );
 
@@ -157,9 +156,9 @@ fn calc_merkle_root_level(
             *new_lr_bit.borrow_mut() = Some(tmp_lr_bit.clone());
 
             // XXX: AssignedCell -> AssignedValue
-            let child = halo2_base::QuantumCell::Existing(&tmp_child);
-            let sibling = halo2_base::QuantumCell::Existing(&tmp_sibling);
-            let lr_bit = halo2_base::QuantumCell::Existing(&tmp_lr_bit);
+            let child = QuantumCell::Existing(&tmp_child);
+            let sibling = QuantumCell::Existing(&tmp_sibling);
+            let lr_bit = QuantumCell::Existing(&tmp_lr_bit);
             *left.borrow_mut() =
                 Some(gate.select(&mut ctx, child.clone(), sibling.clone(), lr_bit.clone()));
             *right.borrow_mut() = Some(gate.select(&mut ctx, sibling, child, lr_bit));
@@ -244,7 +243,7 @@ fn calc_merkle_root(
     let mut h = hash_circuit(layouter.namespace(|| "hash"), chip.clone(), leaf)?;
     for (i, s) in siblings.iter().enumerate() {
         let lr_bit = AssignedCell::new(new_path[i].value, new_path[i].cell());
-        h = calc_merkle_root_level(
+        h = merkle_level(
             layouter.namespace(|| format!("level {i}")),
             chip.clone(),
             gate.clone(),
