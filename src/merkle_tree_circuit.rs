@@ -6,6 +6,7 @@ use halo2_base::{
         GateInstructions,
     },
     halo2_proofs::{
+        arithmetic::Field,
         circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
         halo2curves::bn256::Fr,
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
@@ -16,11 +17,14 @@ use poseidon_circuit::poseidon::{
     primitives::{ConstantLength, P128Pow5T3},
     Hash, Pow5Chip, Pow5Config,
 };
+use rand::Rng;
+
+use crate::merkle_tree::{calc_merkle_root, usize_to_vec, MerkleTree};
 
 pub const WIDTH: usize = 3;
 pub const RATE: usize = 2;
 pub const L: usize = 2;
-pub const K: usize = 17;
+pub const K: usize = 16;
 
 #[derive(Clone)]
 pub struct MyConfig {
@@ -66,23 +70,51 @@ impl Circuit<Fr> for MyCircuit {
 
     fn synthesize(&self, config: MyConfig, mut layouter: impl Layouter<Fr>) -> Result<(), Error> {
         let chip = Pow5Chip::construct(config.poseidon.clone());
-        let a = config.a;
         let gate = config.gate;
+        let a = config.a;
 
-        let input_val0 = assign_val(layouter.namespace(|| "assign 0"), a, Fr::one())?;
-        let input_val1 = assign_val(layouter.namespace(|| "assign 1"), a, Fr::zero())?;
-        let index = assign_val(layouter.namespace(|| "lr bit"), a, Fr::from(2))?;
+        let mut rng = rand::thread_rng();
+        let height = 2;
+        let mut tree = MerkleTree::new(height);
 
-        let hashed = calc_merkle_root(
+        let index = rng.gen_range(0..1 << height);
+        let path = usize_to_vec(index, height);
+        let leaf = [Fr::random(&mut rng), Fr::random(&mut rng)];
+        tree.update(&path, leaf.clone());
+        let proof = tree.prove(&path);
+        let root_raw = calc_merkle_root(index, leaf, proof.clone());
+
+        let leaf_assigned = [
+            assign_val(layouter.namespace(|| "left"), a, leaf[0]).unwrap(),
+            assign_val(layouter.namespace(|| "right"), a, leaf[1]).unwrap(),
+        ];
+
+        let proof_assigned = proof
+            .iter()
+            .map(|x| assign_val(layouter.namespace(|| "space"), a, *x).unwrap())
+            .collect::<Vec<_>>();
+
+        let index_assigend = assign_val(
+            layouter.namespace(|| "index assign"),
+            a,
+            Fr::from(index as u64),
+        )?;
+
+        dbg!(index);
+
+        let expected_root = tree.get_root();
+
+        let root = calc_merkle_root_circuit(
             layouter.namespace(|| "hash"),
             chip,
             gate,
-            vec![input_val0.clone(), input_val1.clone()],
-            [input_val0, input_val1],
-            index,
+            proof_assigned,
+            leaf_assigned,
+            index_assigend,
         )?;
 
-        dbg!(hashed);
+        dbg!(root, expected_root);
+        // dbg!(root_raw);
 
         Ok(())
     }
@@ -108,7 +140,7 @@ pub fn assign_val(
 ) -> Result<AssignedCell<Fr, Fr>, Error> {
     let a_outside = RefCell::new(None);
     layouter.assign_region(
-        || "a",
+        || "assign val",
         |mut region| {
             let a = region.assign_advice(|| "assign", column, 0, || Value::known(val))?;
             *a_outside.borrow_mut() = Some(a);
@@ -134,7 +166,7 @@ pub fn merkle_level(
     let new_lr_bit = RefCell::new(None);
 
     layouter.assign_region(
-        || "a",
+        || "bit decompose",
         |region| {
             let mut ctx = Context::new(
                 region,
@@ -167,8 +199,9 @@ pub fn merkle_level(
         },
     )?;
 
+    // copy constraint
     layouter.assign_region(
-        || "a",
+        || "merkle_level copy constraint",
         |mut region| {
             region.constrain_equal(new_child.clone().into_inner().unwrap().cell(), child.cell())?;
             region.constrain_equal(
@@ -193,7 +226,7 @@ pub fn merkle_level(
     Ok(parent)
 }
 
-fn calc_merkle_root(
+fn calc_merkle_root_circuit(
     mut layouter: impl Layouter<Fr>,
     chip: Pow5Chip<Fr, WIDTH, RATE>,
     gate: FlexGateConfig<Fr>,
@@ -201,27 +234,23 @@ fn calc_merkle_root(
     leaf: [AssignedCell<Fr, Fr>; 2],
     index: AssignedCell<Fr, Fr>,
 ) -> Result<AssignedCell<Fr, Fr>, Error> {
-    let fixed_columns = gate.constants.clone();
-
     let mut new_path = vec![];
     let new_index = RefCell::new(None);
 
     layouter.assign_region(
-        || "a",
+        || "merkle root calc",
         |region| {
             let mut ctx = Context::new(
                 region,
                 ContextParams {
                     max_rows: 1 << K,
                     num_context_ids: 1,
-                    fixed_columns: fixed_columns.clone(),
+                    fixed_columns: gate.constants.clone(),
                 },
             );
-
             let tmp_index =
                 gate.load_witness(&mut ctx, index.value().and_then(|v| Value::known(*v)));
             *new_index.borrow_mut() = Some(tmp_index.clone());
-
             let path = gate.num_to_bits(&mut ctx, &tmp_index, siblings.len());
             for bit in path.into_iter().rev() {
                 new_path.push(bit);
@@ -230,7 +259,6 @@ fn calc_merkle_root(
             Ok(())
         },
     )?;
-
     layouter.assign_region(
         || "copy index",
         |mut region| {

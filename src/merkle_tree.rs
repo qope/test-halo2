@@ -7,7 +7,7 @@ fn native_hash(input: [Fr; 2]) -> Fr {
 }
 
 #[derive(Debug)]
-struct MerkleTree {
+pub struct MerkleTree {
     height: usize,
     nodes: HashMap<Vec<bool>, Node>,
     zero_hashes: Vec<Fr>,
@@ -140,7 +140,7 @@ pub fn usize_to_vec(x: usize, length: usize) -> Vec<bool> {
     v
 }
 
-fn calc_merkle_root(index: usize, leaf: [Fr; 2], siblings: Vec<Fr>) -> Fr {
+pub fn calc_merkle_root(index: usize, leaf: [Fr; 2], siblings: Vec<Fr>) -> Fr {
     let mut position = usize_to_vec(index, siblings.len());
     position.reverse();
     let mut h = native_hash(leaf);
@@ -189,20 +189,9 @@ mod tests {
             tree.update(&path, new_leaf.clone());
             let proof = tree.prove(&path);
             assert_eq!(tree.get_leaf(&path), new_leaf.clone());
-            // verify_merkle_proof(new_leaf, index, tree.get_root(), &proof).unwrap();
-            // dbg!(index, new_leaf, &proof);
             let new_root = calc_merkle_root(index, new_leaf, proof);
             let expected_root = tree.get_root();
-
             assert!(new_root == expected_root);
         }
-
-        // for _ in 0..100 {
-        //     let index = rng.gen_range(0..1 << height);
-        //     let path = usize_to_vec(index, height);
-        //     let leaf = tree.get_leaf(&path);
-        //     let proof = tree.prove(&path);
-        //     verify_merkle_proof(leaf, index, tree.get_root(), &proof).unwrap();
-        // }
     }
 }
