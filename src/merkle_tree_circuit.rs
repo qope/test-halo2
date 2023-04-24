@@ -34,7 +34,7 @@ pub struct MyConfig {
 }
 
 #[derive(Default)]
-pub struct MyCircuit {}
+pub struct MyCircuit;
 
 impl Circuit<Fr> for MyCircuit {
     type Config = MyConfig;
@@ -288,11 +288,11 @@ mod tests {
 
     use super::*;
 
-    // #[test]
-    // fn test_merkle_tree_circuit() {
-    //     let circuit = MyCircuit;
-    //     MockProver::run(K as u32, &circuit, vec![])
-    //         .unwrap()
-    //         .assert_satisfied();
-    // }
+    #[test]
+    fn test_merkle_tree_circuit() {
+        let circuit = MyCircuit;
+        MockProver::run(K as u32, &circuit, vec![])
+            .unwrap()
+            .assert_satisfied();
+    }
 }
