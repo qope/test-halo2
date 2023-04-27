@@ -8,7 +8,7 @@ use halo2_base::{
     halo2_proofs::{
         arithmetic::Field,
         circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
-        halo2curves::bn256::{Fr, G1Affine, G2Affine},
+        halo2curves::bn256::Fr,
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     },
     Context, ContextParams, QuantumCell,
@@ -25,6 +25,112 @@ pub const WIDTH: usize = 3;
 pub const RATE: usize = 2;
 pub const L: usize = 2;
 pub const K: usize = 18;
+
+#[derive(Clone)]
+pub struct MerkleTreeConfig {
+    poseidon: Pow5Config<Fr, WIDTH, RATE>,
+    a: Column<Advice>,
+    gate: FlexGateConfig<Fr>,
+}
+
+#[derive(Default)]
+pub struct MerkleTreeCircuit {
+    pub root: Fr,
+    pub index: usize,
+    pub leaf_hash: Fr,
+    pub siblings: Vec<Fr>,
+}
+
+impl Circuit<Fr> for MerkleTreeCircuit {
+    type Config = MerkleTreeConfig;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self::default()
+    }
+
+    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+        let state = (0..WIDTH).map(|_| meta.advice_column()).collect::<Vec<_>>();
+        let partial_sbox = meta.advice_column();
+
+        let rc_a = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
+        let rc_b = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
+
+        meta.enable_constant(rc_b[0]);
+
+        let poseidon = Pow5Chip::configure::<P128Pow5T3<Fr>>(
+            meta,
+            state.try_into().unwrap(),
+            partial_sbox,
+            rc_a.try_into().unwrap(),
+            rc_b.try_into().unwrap(),
+        );
+
+        let a = meta.advice_column();
+        meta.enable_equality(a);
+
+        let gate = FlexGateConfig::configure(meta, GateStrategy::Vertical, &[1], 1, 0, K);
+
+        Self::Config { poseidon, a, gate }
+    }
+
+    fn synthesize(
+        &self,
+        config: MerkleTreeConfig,
+        mut layouter: impl Layouter<Fr>,
+    ) -> Result<(), Error> {
+        let chip = Pow5Chip::construct(config.poseidon.clone());
+        let gate = config.gate;
+        let a = config.a;
+        let root = self.root;
+        let index = self.index;
+        let leaf_hash = self.leaf_hash;
+        let siblings = self.siblings;
+
+        let leaf_hash_assigned = assign_val(layouter.namespace(|| "leaf"), a, leaf_hash).unwrap();
+
+        let siblings_assigned = siblings
+            .iter()
+            .map(|x| assign_val(layouter.namespace(|| "space"), a, *x).unwrap())
+            .collect::<Vec<_>>();
+
+        let index_assigend = assign_val(
+            layouter.namespace(|| "index assign"),
+            a,
+            Fr::from(index as u64),
+        )?;
+
+        let root_assigned = calc_merkle_root_circuit(
+            layouter.namespace(|| "hash"),
+            chip.clone(),
+            gate.clone(),
+            siblings_assigned,
+            leaf_hash_assigned,
+            index_assigend,
+        )?;
+
+        root_assigned.value().assert_if_known(|&&x| x == root);
+
+        Ok(())
+    }
+}
+
+#[test]
+fn test_verify_merkle_proof() {
+    let height = 32;
+    let mut tree = MerkleTree::new(height);
+
+    let mut rng = rand::thread_rng();
+
+    let index = rng.gen_range(0..1 << height);
+    let path = usize_to_vec(index, height);
+    let leaf = [Fr::random(&mut rng), Fr::random(&mut rng)];
+    tree.update(&path, leaf.clone());
+    let proof = tree.prove(&path);
+    let root_raw = calc_merkle_root(index, leaf, proof.clone());
+
+    todo!()
+}
 
 #[derive(Clone)]
 pub struct MyConfig {
@@ -103,12 +209,14 @@ impl Circuit<Fr> for MyCircuit {
                 Fr::from(index as u64),
             )?;
 
+            let mut leaf_hash_assigned =
+                hash_circuit(layouter.namespace(|| "hash"), chip.clone(), leaf_assigned)?;
             let root = calc_merkle_root_circuit(
                 layouter.namespace(|| "hash"),
                 chip.clone(),
                 gate.clone(),
                 proof_assigned,
-                leaf_assigned,
+                leaf_hash_assigned,
                 index_assigend,
             )?;
 
@@ -230,7 +338,7 @@ pub fn calc_merkle_root_circuit(
     chip: Pow5Chip<Fr, WIDTH, RATE>,
     gate: FlexGateConfig<Fr>,
     siblings: Vec<AssignedCell<Fr, Fr>>,
-    leaf: [AssignedCell<Fr, Fr>; 2],
+    leaf_hash: AssignedCell<Fr, Fr>,
     index: AssignedCell<Fr, Fr>,
 ) -> Result<AssignedCell<Fr, Fr>, Error> {
     let mut new_path = vec![];
@@ -267,7 +375,8 @@ pub fn calc_merkle_root_circuit(
         },
     )?;
 
-    let mut h = hash_circuit(layouter.namespace(|| "hash"), chip.clone(), leaf)?;
+    // let mut h = hash_circuit(layouter.namespace(|| "hash"), chip.clone(), leaf)?;
+    let mut h = leaf_hash;
     for (i, s) in siblings.iter().enumerate() {
         let lr_bit = AssignedCell::new(new_path[i].value, new_path[i].cell());
         h = merkle_level(

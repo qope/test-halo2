@@ -1,3 +1,4 @@
+mod field;
 mod map_to_curve;
 mod merkle_tree;
 mod merkle_tree_circuit;
