@@ -19,12 +19,15 @@ use crate::merkle_tree_circuit::assign_val;
 const GOLDILOCKS_FIELD_ORDER: u64 = 18446744069414584321;
 
 #[derive(Copy, Clone, Debug)]
-pub struct FrExtension(pub [Fr; 2]);
+pub struct GoldilocksField(pub Fr);
+
+#[derive(Copy, Clone, Debug)]
+pub struct GoldilocksExtension(pub [Fr; 2]);
 
 #[derive(Clone, Debug)]
-pub struct AssignedFrExtension(pub [AssignedCell<Fr, Fr>; 2]);
+pub struct AssignedGoldilocksExtension(pub [AssignedCell<Fr, Fr>; 2]);
 
-impl Deref for AssignedFrExtension {
+impl Deref for AssignedGoldilocksExtension {
     type Target = [AssignedCell<Fr, Fr>; 2];
 
     fn deref(&self) -> &Self::Target {
@@ -32,19 +35,19 @@ impl Deref for AssignedFrExtension {
     }
 }
 
-impl From<Fr> for FrExtension {
+impl From<Fr> for GoldilocksExtension {
     fn from(value: Fr) -> Self {
         Self([value, Fr::zero()])
     }
 }
 
-impl FrExtension {
+impl GoldilocksExtension {
     pub fn zero() -> Self {
         Self([Fr::zero(); 2])
     }
 }
 
-// impl AssignedFrExtension {
+// impl AssignedGoldilocksExtension {
 //     pub fn zero(&mut ctx: , a, ) -> Self {
 //         let zero = Fr::zero();
 //         let tmp_index =
@@ -74,10 +77,10 @@ pub fn from_base_field(
     gate: FlexGateConfig<Fr>,
     advice_column: Column<Advice>,
     value: AssignedCell<Fr, Fr>,
-) -> Result<AssignedFrExtension, Error> {
+) -> Result<AssignedGoldilocksExtension, Error> {
     let zero = zero(layouter.namespace(|| "assign zero"), gate, advice_column)?;
 
-    Ok(AssignedFrExtension([value, zero]))
+    Ok(AssignedGoldilocksExtension([value, zero]))
 }
 
 const K: usize = 18;
@@ -88,9 +91,9 @@ pub fn add_extension(
     gate: FlexGateConfig<Fr>,
     range: RangeConfig<Fr>,
     advice_column: Column<Advice>,
-    a: AssignedFrExtension,
-    b: AssignedFrExtension,
-) -> Result<AssignedFrExtension, Error> {
+    a: AssignedGoldilocksExtension,
+    b: AssignedGoldilocksExtension,
+) -> Result<AssignedGoldilocksExtension, Error> {
     let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output_assigned = RefCell::new(None);
@@ -168,7 +171,7 @@ pub fn add_extension(
 
     let output_assigned = output_assigned.clone().into_inner().unwrap();
 
-    Ok(AssignedFrExtension(output_assigned))
+    Ok(AssignedGoldilocksExtension(output_assigned))
 }
 
 /// Constrain `output = a * b`.
@@ -177,9 +180,9 @@ pub fn mul_extension(
     gate: FlexGateConfig<Fr>,
     range: RangeConfig<Fr>,
     advice_column: Column<Advice>,
-    a: AssignedFrExtension,
-    b: AssignedFrExtension,
-) -> Result<AssignedFrExtension, Error> {
+    a: AssignedGoldilocksExtension,
+    b: AssignedGoldilocksExtension,
+) -> Result<AssignedGoldilocksExtension, Error> {
     let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output_assigned = RefCell::new(None);
@@ -260,7 +263,7 @@ pub fn mul_extension(
     let output0_cell = AssignedCell::new(output_assigned[0].value, output_assigned[0].cell);
     let output1_cell = AssignedCell::new(output_assigned[1].value, output_assigned[1].cell);
 
-    Ok(AssignedFrExtension([output0_cell, output1_cell]))
+    Ok(AssignedGoldilocksExtension([output0_cell, output1_cell]))
 }
 
 /// Constrain `output = a * scalar`.
@@ -270,8 +273,8 @@ pub fn scalar_extension(
     range: RangeConfig<Fr>,
     advice_column: Column<Advice>,
     scalar: Fr,
-    value: AssignedFrExtension,
-) -> Result<AssignedFrExtension, Error> {
+    value: AssignedGoldilocksExtension,
+) -> Result<AssignedGoldilocksExtension, Error> {
     let value_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output_assigned = RefCell::new(None);
 
@@ -347,7 +350,7 @@ pub fn scalar_extension(
 
     let output_assigned = output_assigned.clone().into_inner().unwrap();
 
-    Ok(AssignedFrExtension(output_assigned))
+    Ok(AssignedGoldilocksExtension(output_assigned))
 }
 
 /// Constrain `output = constant0 * multiplicand0 * multiplicand1 + constant1 * addend`.
@@ -358,10 +361,10 @@ pub fn arithmetic_extension(
     advice_column: Column<Advice>,
     constant0: Fr,
     constant1: Fr,
-    multiplicand0: AssignedFrExtension,
-    multiplicand1: AssignedFrExtension,
-    addend: AssignedFrExtension,
-) -> Result<AssignedFrExtension, Error> {
+    multiplicand0: AssignedGoldilocksExtension,
+    multiplicand1: AssignedGoldilocksExtension,
+    addend: AssignedGoldilocksExtension,
+) -> Result<AssignedGoldilocksExtension, Error> {
     let tmp0 = mul_extension(
         layouter,
         gate,
@@ -466,56 +469,56 @@ pub fn mod_by_goldilocks_order(
     Ok(output_cell)
 }
 
-// impl<'a> Neg for &'a FrExtension {
-//     type Output = FrExtension;
+// impl<'a> Neg for &'a GoldilocksExtension {
+//     type Output = GoldilocksExtension;
 
 //     #[inline]
-//     fn neg(self) -> FrExtension {
+//     fn neg(self) -> GoldilocksExtension {
 //         self.neg()
 //     }
 // }
 
-// impl Neg for FrExtension {
-//     type Output = FrExtension;
+// impl Neg for GoldilocksExtension {
+//     type Output = GoldilocksExtension;
 
 //     #[inline]
-//     fn neg(self) -> FrExtension {
+//     fn neg(self) -> GoldilocksExtension {
 //         -&self
 //     }
 // }
 
-// impl<'a, 'b> Sub<&'b FrExtension> for &'a FrExtension {
-//     type Output = FrExtension;
+// impl<'a, 'b> Sub<&'b GoldilocksExtension> for &'a GoldilocksExtension {
+//     type Output = GoldilocksExtension;
 
 //     #[inline]
-//     fn sub(self, rhs: &'b FrExtension) -> FrExtension {
+//     fn sub(self, rhs: &'b GoldilocksExtension) -> GoldilocksExtension {
 //         self.sub(rhs)
 //     }
 // }
 
-// impl<'a, 'b> Add<&'b FrExtension> for &'a FrExtension {
-//     type Output = FrExtension;
+// impl<'a, 'b> Add<&'b GoldilocksExtension> for &'a GoldilocksExtension {
+//     type Output = GoldilocksExtension;
 
 //     #[inline]
-//     fn add(self, rhs: &'b FrExtension) -> FrExtension {
+//     fn add(self, rhs: &'b GoldilocksExtension) -> GoldilocksExtension {
 //         self.add(rhs)
 //     }
 // }
 
-// impl<'a, 'b> Mul<&'b FrExtension> for FrExtension {
-//     type Output = FrExtension;
+// impl<'a, 'b> Mul<&'b GoldilocksExtension> for GoldilocksExtension {
+//     type Output = GoldilocksExtension;
 
 //     #[inline]
-//     fn mul(self, rhs: &'b FrExtension) -> FrExtension {
+//     fn mul(self, rhs: &'b GoldilocksExtension) -> GoldilocksExtension {
 //         self.mul(rhs)
 //     }
 // }
 
-// impl<'a, 'b> Mul<&'b FrExtension> for &'a FrExtension {
-//     type Output = FrExtension;
+// impl<'a, 'b> Mul<&'b GoldilocksExtension> for &'a GoldilocksExtension {
+//     type Output = GoldilocksExtension;
 
 //     #[inline]
-//     fn mul(self, rhs: &'b FrExtension) -> FrExtension {
+//     fn mul(self, rhs: &'b GoldilocksExtension) -> GoldilocksExtension {
 //         self.mul(rhs)
 //     }
 // }
