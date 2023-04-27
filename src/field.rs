@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    ops::{Add, Deref, Div, Mul, Neg, Sub},
+    ops::{Deref, Div},
 };
 
 use halo2_base::{
@@ -15,6 +15,8 @@ use halo2_base::{
 use num_bigint::BigUint;
 
 use crate::merkle_tree_circuit::assign_val;
+
+const GOLDILOCKS_FIELD_ORDER: u64 = 18446744069414584321;
 
 #[derive(Copy, Clone, Debug)]
 pub struct FrExtension(pub [Fr; 2]);
@@ -80,6 +82,7 @@ pub fn from_base_field(
 
 const K: usize = 18;
 
+/// Constrain `output = a + b`.
 pub fn add_extension(
     mut layouter: impl Layouter<Fr>,
     gate: FlexGateConfig<Fr>,
@@ -109,6 +112,7 @@ pub fn add_extension(
             let b0 = QuantumCell::Existing(&b_assigned.clone().into_inner().unwrap()[0]);
             let b1 = QuantumCell::Existing(&b_assigned.clone().into_inner().unwrap()[1]);
 
+            // output0 = a0 + b0
             let output0 = gate.add(&mut ctx, a0, b0);
             let output0 = AssignedCell::new(output0.value, output0.cell);
             let output0 = mod_by_goldilocks_order(
@@ -120,6 +124,7 @@ pub fn add_extension(
             )
             .unwrap();
 
+            // output1 = a1 + b1
             let output1 = gate.add(&mut ctx, a1, b1);
             let output1 = AssignedCell::new(output1.value, output1.cell);
             let output1 = mod_by_goldilocks_order(
@@ -130,13 +135,6 @@ pub fn add_extension(
                 output1,
             )
             .unwrap();
-
-            // fn mul(self, rhs: Self) -> Self {
-            //     let Self([a0, a1]) = self;
-            //     let Self([b0, b1]) = rhs;
-            //     let c = ext2_mul([a0.0, a1.0], [b0.0, b1.0]);
-            //     Self(c)
-            // }
 
             *output_assigned.borrow_mut() = Some([output0, output1]);
 
@@ -173,6 +171,7 @@ pub fn add_extension(
     Ok(AssignedFrExtension(output_assigned))
 }
 
+/// Constrain `output = a * b`.
 pub fn mul_extension(
     mut layouter: impl Layouter<Fr>,
     gate: FlexGateConfig<Fr>,
@@ -202,7 +201,7 @@ pub fn mul_extension(
             let b0 = QuantumCell::Existing(&b_assigned.clone().into_inner().unwrap()[0]);
             let b1 = QuantumCell::Existing(&b_assigned.clone().into_inner().unwrap()[1]);
 
-            // Computes a0 * b0 + W * a1 * b1;
+            // output0 = a0 * b0 + W * a1 * b1
             let w = Fr::from(7);
             let w_assigned = gate.load_witness(&mut ctx, Value::known(w));
             let tmp0 = gate.mul(&mut ctx, a0, b0);
@@ -218,7 +217,7 @@ pub fn mul_extension(
                 QuantumCell::Existing(&tmp1),
             );
 
-            // Computes a0 * b1 + a1 * b0;
+            // output1 = a0 * b1 + a1 * b0
             let tmp0 = gate.mul(&mut ctx, a0, b1);
             let tmp1 = gate.mul(&mut ctx, a1, b0);
             let output1 = gate.add(
@@ -264,6 +263,7 @@ pub fn mul_extension(
     Ok(AssignedFrExtension([output0_cell, output1_cell]))
 }
 
+/// Constrain `output = a * scalar`.
 pub fn scalar_extension(
     mut layouter: impl Layouter<Fr>,
     gate: FlexGateConfig<Fr>,
@@ -291,6 +291,7 @@ pub fn scalar_extension(
             let a0 = value_assigned.clone().into_inner().unwrap()[0];
             let a1 = value_assigned.clone().into_inner().unwrap()[1];
 
+            // output0 = a0 * scalar
             let output0 = gate.mul(
                 &mut ctx,
                 QuantumCell::Existing(&a0),
@@ -306,6 +307,7 @@ pub fn scalar_extension(
             )
             .unwrap();
 
+            // output0 = a1 * scalar
             let output1 = gate.mul(
                 &mut ctx,
                 QuantumCell::Existing(&a1),
@@ -348,7 +350,7 @@ pub fn scalar_extension(
     Ok(AssignedFrExtension(output_assigned))
 }
 
-/// constant0 * multiplicand0 * multiplicand1 + constant1 * addend
+/// Constrain `output = constant0 * multiplicand0 * multiplicand1 + constant1 * addend`.
 pub fn arithmetic_extension(
     mut layouter: impl Layouter<Fr>,
     gate: FlexGateConfig<Fr>,
@@ -374,6 +376,7 @@ pub fn arithmetic_extension(
     add_extension(layouter, gate, range, advice_column, tmp0, tmp1)
 }
 
+/// Constrain `output = a % GOLDILOCKS_FIELD_ORDER`.
 pub fn mod_by_goldilocks_order(
     mut layouter: impl Layouter<Fr>,
     gate: FlexGateConfig<Fr>,
@@ -397,7 +400,7 @@ pub fn mod_by_goldilocks_order(
             );
 
             // output = a % order
-            let order = Fr::from(18446744069414584321); // the order of Goldilocks field
+            let order = Fr::from(GOLDILOCKS_FIELD_ORDER); // the order of Goldilocks field
             let order_assigned = gate.load_witness(&mut ctx, Value::known(order));
 
             // q = a - a % order
@@ -423,12 +426,12 @@ pub fn mod_by_goldilocks_order(
                 QuantumCell::Existing(&tmp),
             );
 
-            // Divide a constraint into two parts to check `0 <= output < order`
+            // Divide the constraint `0 <= output < order` into two parts.
 
-            // 0 <= output < 2^64 and
+            // (1) 0 <= output < 2^64
             range.range_check(&mut ctx, &output, 64);
 
-            // 0 <= order - 1 - output < 2^64
+            // (2) 0 <= order - 1 - output < 2^64
             let one_assigned = gate.load_witness(&mut ctx, Value::known(Fr::one()));
             let order_minus_one_assigned = gate.sub(
                 &mut ctx,
@@ -463,56 +466,56 @@ pub fn mod_by_goldilocks_order(
     Ok(output_cell)
 }
 
-impl<'a> Neg for &'a FrExtension {
-    type Output = FrExtension;
+// impl<'a> Neg for &'a FrExtension {
+//     type Output = FrExtension;
 
-    #[inline]
-    fn neg(self) -> FrExtension {
-        self.neg()
-    }
-}
+//     #[inline]
+//     fn neg(self) -> FrExtension {
+//         self.neg()
+//     }
+// }
 
-impl Neg for FrExtension {
-    type Output = FrExtension;
+// impl Neg for FrExtension {
+//     type Output = FrExtension;
 
-    #[inline]
-    fn neg(self) -> FrExtension {
-        -&self
-    }
-}
+//     #[inline]
+//     fn neg(self) -> FrExtension {
+//         -&self
+//     }
+// }
 
-impl<'a, 'b> Sub<&'b FrExtension> for &'a FrExtension {
-    type Output = FrExtension;
+// impl<'a, 'b> Sub<&'b FrExtension> for &'a FrExtension {
+//     type Output = FrExtension;
 
-    #[inline]
-    fn sub(self, rhs: &'b FrExtension) -> FrExtension {
-        self.sub(rhs)
-    }
-}
+//     #[inline]
+//     fn sub(self, rhs: &'b FrExtension) -> FrExtension {
+//         self.sub(rhs)
+//     }
+// }
 
-impl<'a, 'b> Add<&'b FrExtension> for &'a FrExtension {
-    type Output = FrExtension;
+// impl<'a, 'b> Add<&'b FrExtension> for &'a FrExtension {
+//     type Output = FrExtension;
 
-    #[inline]
-    fn add(self, rhs: &'b FrExtension) -> FrExtension {
-        self.add(rhs)
-    }
-}
+//     #[inline]
+//     fn add(self, rhs: &'b FrExtension) -> FrExtension {
+//         self.add(rhs)
+//     }
+// }
 
-impl<'a, 'b> Mul<&'b FrExtension> for FrExtension {
-    type Output = FrExtension;
+// impl<'a, 'b> Mul<&'b FrExtension> for FrExtension {
+//     type Output = FrExtension;
 
-    #[inline]
-    fn mul(self, rhs: &'b FrExtension) -> FrExtension {
-        self.mul(rhs)
-    }
-}
+//     #[inline]
+//     fn mul(self, rhs: &'b FrExtension) -> FrExtension {
+//         self.mul(rhs)
+//     }
+// }
 
-impl<'a, 'b> Mul<&'b FrExtension> for &'a FrExtension {
-    type Output = FrExtension;
+// impl<'a, 'b> Mul<&'b FrExtension> for &'a FrExtension {
+//     type Output = FrExtension;
 
-    #[inline]
-    fn mul(self, rhs: &'b FrExtension) -> FrExtension {
-        self.mul(rhs)
-    }
-}
+//     #[inline]
+//     fn mul(self, rhs: &'b FrExtension) -> FrExtension {
+//         self.mul(rhs)
+//     }
+// }
