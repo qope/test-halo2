@@ -1,10 +1,10 @@
-use std::rc::Rc;
+use std::{rc::Rc, cell::RefCell};
 
 use ethereum_types::Address;
 use halo2_base::halo2_proofs::{
     dev::MockProver,
     halo2curves::bn256::{Bn256, Fq, Fr, G1Affine},
-    plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ProvingKey, VerifyingKey},
+    plonk::{Error, create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ProvingKey, VerifyingKey, Advice, Column},
     poly::{
         commitment::ParamsProver,
         kzg::{
@@ -14,7 +14,7 @@ use halo2_base::halo2_proofs::{
         },
         VerificationStrategy,
     },
-    transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
+    transcript::{TranscriptReadBuffer, TranscriptWriterBuffer}, circuit::{Layouter, AssignedCell, Value},
 };
 use itertools::Itertools;
 use rand::rngs::OsRng;
@@ -125,4 +125,22 @@ pub fn evm_verify(deployment_code: Vec<u8>, instances: Vec<Vec<Fr>>, proof: Vec<
         !result.reverted
     };
     assert!(success);
+}
+
+pub fn assign_val(
+    mut layouter: impl Layouter<Fr>,
+    column: Column<Advice>,
+    val: Fr,
+) -> Result<AssignedCell<Fr, Fr>, Error> {
+    let a_outside = RefCell::new(None);
+    layouter.assign_region(
+        || "assign val",
+        |mut region| {
+            let a = region.assign_advice(|| "assign", column, 0, || Value::known(val))?;
+            *a_outside.borrow_mut() = Some(a);
+            Ok(())
+        },
+    )?;
+    let a_value = a_outside.into_inner().unwrap();
+    Ok(a_value)
 }

@@ -240,24 +240,6 @@ pub fn hash_circuit(
     Ok(output)
 }
 
-pub fn assign_val(
-    mut layouter: impl Layouter<Fr>,
-    column: Column<Advice>,
-    val: Fr,
-) -> Result<AssignedCell<Fr, Fr>, Error> {
-    let a_outside = RefCell::new(None);
-    layouter.assign_region(
-        || "assign val",
-        |mut region| {
-            let a = region.assign_advice(|| "assign", column, 0, || Value::known(val))?;
-            *a_outside.borrow_mut() = Some(a);
-            Ok(())
-        },
-    )?;
-    let a_value = a_outside.into_inner().unwrap();
-    Ok(a_value)
-}
-
 pub fn merkle_level(
     mut layouter: impl Layouter<Fr>,
     chip: Pow5Chip<Fr, WIDTH, RATE>,
