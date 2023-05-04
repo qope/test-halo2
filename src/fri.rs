@@ -1,31 +1,22 @@
-use std::{
-    borrow::Borrow,
-    cell::RefCell,
-    ops::{Add, Mul, Neg, Sub},
-};
-
 use halo2_base::{
     gates::{
         flex_gate::{FlexGateConfig, GateStrategy},
-        GateInstructions,
+        range::RangeConfig,
     },
     halo2_proofs::{
-        arithmetic::Field,
-        circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
-        halo2curves::bn256::{Fr, G1Affine, G2Affine},
+        circuit::{Layouter, SimpleFloorPlanner},
+        halo2curves::bn256::Fr,
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     },
-    Context, ContextParams, QuantumCell,
 };
-use poseidon_circuit::poseidon::{
-    primitives::{ConstantLength, P128Pow5T3},
-    Hash, Pow5Chip, Pow5Config,
-};
-use rand::Rng;
+use poseidon_circuit::poseidon::{primitives::P128Pow5T3, Pow5Chip, Pow5Config};
 
 use crate::{
-    field::FrExtension,
-    merkle_tree::{calc_merkle_root, usize_to_vec, MerkleTree},
+    field::{
+        add_extension, div_extension, from_base_field, neg_extension, zero_assigned,
+        AssignedGoldilocksExtension, AssignedGoldilocksField, GoldilocksExtension,
+    },
+    reducing::{AssignedReducingFactor, ReducingFactor},
 };
 
 pub const WIDTH: usize = 3;
@@ -86,26 +77,6 @@ impl Circuit<Fr> for FriCircuit {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct ReducingFactor {
-    base: FrExtension,
-    count: u64,
-}
-
-impl ReducingFactor {
-    pub fn new(base: FrExtension) -> Self {
-        Self { base, count: 0 }
-    }
-
-    pub fn reduce(
-        &mut self,
-        iter: impl DoubleEndedIterator<Item = impl Borrow<FrExtension>>,
-    ) -> FrExtension {
-        iter.rev()
-            .fold(FrExtension::zero(), |acc, x| self.mul(acc) + *x.borrow())
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
 pub struct FriPolynomialInfo {
     /// Index into `FriInstanceInfo`'s `oracles` list.
     pub oracle_index: usize,
@@ -115,7 +86,13 @@ pub struct FriPolynomialInfo {
 
 #[derive(Clone, Debug)]
 pub struct FriBatchInfo {
-    pub point: FrExtension,
+    pub point: GoldilocksExtension,
+    pub polynomials: Vec<FriPolynomialInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AssignedFriBatchInfo {
+    pub point: AssignedGoldilocksExtension,
     pub polynomials: Vec<FriPolynomialInfo>,
 }
 
@@ -133,20 +110,80 @@ pub struct FriInstanceInfo {
     pub batches: Vec<FriBatchInfo>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AssignedFriInstanceInfo {
+    /// The oracles involved, not counting oracles created during the commit phase.
+    pub oracles: Vec<FriOracleInfo>,
+    /// Batches of openings, where each batch is associated with a particular point.
+    pub batches: Vec<AssignedFriBatchInfo>,
+}
+
 /// opened at that point.
 #[derive(Clone, Debug)]
 pub struct PrecomputedReducedOpenings {
-    pub reduced_openings_at_point: Vec<FrExtension>,
+    pub reduced_openings_at_point: Vec<GoldilocksExtension>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AssignedPrecomputedReducedOpenings {
+    pub reduced_openings_at_point: Vec<AssignedGoldilocksExtension>,
 }
 
 #[derive(Clone, Debug)]
 pub struct MerkleProof {
-    siblings: Vec<Fr>,
+    pub siblings: Vec<Fr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AssignedMerkleProof {
+    pub siblings: Vec<AssignedGoldilocksField>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FriInitialTreeProof {
     pub evals_proofs: Vec<(Vec<Fr>, MerkleProof)>,
+}
+
+const SALT_SIZE: usize = 4;
+
+pub fn salt_size(salted: bool) -> usize {
+    if salted {
+        SALT_SIZE
+    } else {
+        0
+    }
+}
+
+impl FriInitialTreeProof {
+    pub(crate) fn unsalted_eval(&self, oracle_index: usize, poly_index: usize, salted: bool) -> Fr {
+        self.unsalted_evals(oracle_index, salted)[poly_index]
+    }
+
+    fn unsalted_evals(&self, oracle_index: usize, salted: bool) -> &[Fr] {
+        let evals = &self.evals_proofs[oracle_index].0;
+        &evals[..evals.len() - salt_size(salted)]
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AssignedFriInitialTreeProof {
+    pub evals_proofs: Vec<(Vec<AssignedGoldilocksField>, AssignedMerkleProof)>,
+}
+
+impl AssignedFriInitialTreeProof {
+    pub(crate) fn unsalted_eval(
+        &self,
+        oracle_index: usize,
+        poly_index: usize,
+        salted: bool,
+    ) -> AssignedGoldilocksField {
+        self.unsalted_evals(oracle_index, salted)[poly_index].clone()
+    }
+
+    fn unsalted_evals(&self, oracle_index: usize, salted: bool) -> &[AssignedGoldilocksField] {
+        let evals = &self.evals_proofs[oracle_index].0;
+        &evals[..evals.len() - salt_size(salted)]
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -202,56 +239,148 @@ pub struct FriParams {
 }
 
 pub fn fri_combine_initial(
-    mut layouter: impl Layouter<Fr>,
-    gate: FlexGateConfig<Fr>,
-    // siblings: Vec<AssignedCell<Fr, Fr>>,
-    // leaf_hash: AssignedCell<Fr, Fr>,
-    // index: AssignedCell<Fr, Fr>,
     instance: &FriInstanceInfo,
     proof: &FriInitialTreeProof,
-    alpha: FrExtension,
+    alpha: GoldilocksExtension,
     subgroup_x: Fr,
     precomputed_reduced_evals: &PrecomputedReducedOpenings,
     params: &FriParams,
 ) {
-    layouter.assign_region(
-        || "bit decompose",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
+    let subgroup_x = GoldilocksExtension::from(subgroup_x);
+    let mut alpha = ReducingFactor::new(alpha);
+    let mut sum = GoldilocksExtension::zero();
 
-            let subgroup_x = FrExtension::from(subgroup_x);
-            let mut alpha = ReducingFactor::new(alpha);
-            let mut sum = FrExtension::zero();
+    for (batch, reduced_openings) in instance
+        .batches
+        .iter()
+        .zip(&precomputed_reduced_evals.reduced_openings_at_point)
+    {
+        let FriBatchInfo { point, polynomials } = batch;
+        let evals = polynomials
+            .iter()
+            .map(|p| {
+                let poly_blinding = instance.oracles[p.oracle_index].blinding;
+                let salted = params.hiding && poly_blinding;
+                proof.unsalted_eval(p.oracle_index, p.polynomial_index, salted)
+            })
+            .map(GoldilocksExtension::from);
+        let reduced_evals = alpha.reduce(evals);
+        let numerator = reduced_evals - *reduced_openings;
+        let denominator = subgroup_x - *point;
+        sum = alpha.shift(sum);
+        sum += numerator / denominator;
+    }
+}
 
-            for (batch, reduced_openings) in instance
-                .batches
-                .iter()
-                .zip(&precomputed_reduced_evals.reduced_openings_at_point)
-            {
-                let FriBatchInfo { point, polynomials } = batch;
-                let evals = polynomials
-                    .iter()
-                    .map(|p| {
-                        let poly_blinding = instance.oracles[p.oracle_index].blinding;
-                        let salted = params.hiding && poly_blinding;
-                        proof.unsalted_eval(p.oracle_index, p.polynomial_index, salted)
-                    })
-                    .map(FrExtension::from);
-                let reduced_evals = alpha.reduce(evals);
-                let numerator = reduced_evals - *reduced_openings;
-                let denominator = subgroup_x - *point;
-                sum = alpha.shift(sum);
-                sum += numerator / denominator;
-            }
+pub fn fri_combine_initial_assigned(
+    mut layouter: impl Layouter<Fr>,
+    gate: &FlexGateConfig<Fr>,
+    range: &RangeConfig<Fr>,
+    advice_column: Column<Advice>,
+    instance: &AssignedFriInstanceInfo,
+    proof: &AssignedFriInitialTreeProof,
+    alpha: AssignedGoldilocksExtension,
+    subgroup_x: AssignedGoldilocksField,
+    precomputed_reduced_evals: &AssignedPrecomputedReducedOpenings,
+    params: &FriParams,
+) -> Result<(), Error> {
+    // layouter
+    //     .assign_region(
+    //         || "bit decompose",
+    //         |region| {
+    // let mut ctx = Context::new(
+    //     region,
+    //     ContextParams {
+    //         max_rows: 1 << K,
+    //         num_context_ids: 1,
+    //         fixed_columns: gate.constants.clone(),
+    //     },
+    // );
 
-            Ok(())
-        },
-    )?;
+    let zero = zero_assigned(layouter.namespace(|| "assign zero"), advice_column)?;
+    let subgroup_x = AssignedGoldilocksExtension([subgroup_x.0, zero]);
+    let mut alpha = AssignedReducingFactor::new(alpha);
+    let mut sum = AssignedGoldilocksExtension::zero(
+        layouter.namespace(|| "assign zero extension"),
+        advice_column,
+    )
+    .unwrap();
+
+    for (batch, reduced_openings) in instance
+        .batches
+        .iter()
+        .zip(&precomputed_reduced_evals.reduced_openings_at_point)
+    {
+        let AssignedFriBatchInfo { point, polynomials } = batch;
+        let evals = polynomials
+            .iter()
+            .map(|p| {
+                let poly_blinding = instance.oracles[p.oracle_index].blinding;
+                let salted = params.hiding && poly_blinding;
+                proof.unsalted_eval(p.oracle_index, p.polynomial_index, salted)
+            })
+            .map(|value| {
+                from_base_field(
+                    layouter.namespace(|| "from base field"),
+                    advice_column,
+                    value.0,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let reduced_evals = alpha.reduce(
+            layouter.namespace(|| "reduce"),
+            gate,
+            range,
+            advice_column,
+            &evals,
+        );
+        let tmp = neg_extension(
+            layouter.namespace(|| "neg1"),
+            gate,
+            range,
+            reduced_openings.clone(),
+        )
+        .unwrap();
+        let numerator = add_extension(
+            layouter.namespace(|| "add1"),
+            gate,
+            range,
+            reduced_evals,
+            tmp,
+        )
+        .unwrap();
+        let tmp = neg_extension(layouter.namespace(|| "neg2"), gate, range, point.clone()).unwrap();
+        let denominator = add_extension(
+            layouter.namespace(|| "add2"),
+            gate,
+            range,
+            subgroup_x.clone(),
+            tmp,
+        )
+        .unwrap();
+        sum = alpha.shift(
+            layouter.namespace(|| "shift alpha by sum"),
+            gate,
+            range,
+            advice_column,
+            sum,
+        );
+        let tmp = div_extension(
+            layouter.namespace(|| "div"),
+            gate,
+            range,
+            numerator,
+            denominator,
+        )
+        .unwrap();
+        sum = add_extension(layouter.namespace(|| "add"), gate, range, sum, tmp).unwrap();
+    }
+
+    //         Ok(())
+    //     },
+    // )
+    // .unwrap();
+
+    Ok(())
 }

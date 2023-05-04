@@ -1,7 +1,11 @@
+
+#![allow(clippy::too_many_arguments)]
+
 pub mod field;
-// mod fri;
+pub mod fri;
 mod map_to_curve;
 mod merkle_tree;
 // mod merkle_tree_circuit;
 mod poseidon_test;
+pub mod reducing;
 mod utils;

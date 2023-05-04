@@ -1,10 +1,14 @@
-use std::{rc::Rc, cell::RefCell};
+use std::{cell::RefCell, rc::Rc};
 
 use ethereum_types::Address;
 use halo2_base::halo2_proofs::{
+    circuit::{AssignedCell, Layouter, Value},
     dev::MockProver,
     halo2curves::bn256::{Bn256, Fq, Fr, G1Affine},
-    plonk::{Error, create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ProvingKey, VerifyingKey, Advice, Column},
+    plonk::{
+        create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column, Error,
+        ProvingKey, VerifyingKey,
+    },
     poly::{
         commitment::ParamsProver,
         kzg::{
@@ -14,9 +18,10 @@ use halo2_base::halo2_proofs::{
         },
         VerificationStrategy,
     },
-    transcript::{TranscriptReadBuffer, TranscriptWriterBuffer}, circuit::{Layouter, AssignedCell, Value},
+    transcript::{TranscriptReadBuffer, TranscriptWriterBuffer},
 };
 use itertools::Itertools;
+use num_bigint::BigUint;
 use rand::rngs::OsRng;
 use snark_verifier::{
     loader::evm::{self, encode_calldata, EvmLoader, ExecutorBuilder},
@@ -125,6 +130,17 @@ pub fn evm_verify(deployment_code: Vec<u8>, instances: Vec<Vec<Fr>>, proof: Vec<
         !result.reverted
     };
     assert!(success);
+}
+
+pub(crate) fn convert_fr_to_big_uint(value: Fr) -> BigUint {
+    BigUint::from_bytes_le(&value.to_bytes())
+}
+
+pub(crate) fn convert_big_uint_to_fr(value: BigUint) -> Fr {
+    let mut value_bytes = value.to_bytes_le();
+    value_bytes.resize(32, 0);
+
+    Fr::from_bytes(&value_bytes.try_into().unwrap()).unwrap()
 }
 
 pub fn assign_val(
