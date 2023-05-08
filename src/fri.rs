@@ -70,9 +70,7 @@ impl Circuit<Fr> for FriCircuit {
     }
 
     fn synthesize(&self, config: Self::Config, layouter: impl Layouter<Fr>) -> Result<(), Error> {
-        let chip = Pow5Chip::construct(config.poseidon.clone());
-        let gate = config.gate;
-        let a = config.a;
+        let chip = Pow5Chip::construct(config.poseidon);
 
         todo!()
     }
@@ -100,11 +98,15 @@ pub struct AssignedFriBatchInfo {
 
 impl AssignedFriBatchInfo {
     pub fn assign(
-        layouter: &mut impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
         advice_column: Column<Advice>,
         value: &FriBatchInfo,
     ) -> Result<Self, Error> {
-        let point = AssignedGoldilocksExtension::assign(layouter, advice_column, value.point)?;
+        let point = AssignedGoldilocksExtension::assign(
+            layouter.namespace(|| "assign value.point"),
+            advice_column,
+            value.point,
+        )?;
         let polynomials = value.polynomials.clone();
 
         Ok(Self { point, polynomials })
@@ -135,7 +137,7 @@ pub struct AssignedFriInstanceInfo {
 
 impl AssignedFriInstanceInfo {
     pub fn assign(
-        layouter: &mut impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
         advice_column: Column<Advice>,
         value: &FriInstanceInfo,
     ) -> Result<Self, Error> {
@@ -144,7 +146,14 @@ impl AssignedFriInstanceInfo {
         let batches = value
             .batches
             .iter()
-            .map(|batch| AssignedFriBatchInfo::assign(layouter, advice_column, batch).unwrap())
+            .map(|batch| {
+                AssignedFriBatchInfo::assign(
+                    layouter.namespace(|| "assign batch"),
+                    advice_column,
+                    batch,
+                )
+                .unwrap()
+            })
             .collect::<Vec<_>>();
 
         Ok(Self { oracles, batches })
@@ -162,6 +171,30 @@ pub struct AssignedPrecomputedReducedOpenings {
     pub reduced_openings_at_point: Vec<AssignedGoldilocksExtension>,
 }
 
+impl AssignedPrecomputedReducedOpenings {
+    pub fn assign(
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        value: &PrecomputedReducedOpenings,
+    ) -> Result<Self, Error> {
+        let result = Self {
+            reduced_openings_at_point: value
+                .reduced_openings_at_point
+                .iter()
+                .map(|x| {
+                    AssignedGoldilocksExtension::assign(
+                        layouter.namespace(|| "assign x"),
+                        advice_column,
+                        *x,
+                    )
+                })
+                .collect::<Result<Vec<_>, Error>>()?,
+        };
+
+        Ok(result)
+    }
+}
+
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct HashOut {
     pub elements: [GoldilocksField; 4],
@@ -174,14 +207,27 @@ pub struct AssignedHashOut {
 
 impl AssignedHashOut {
     pub fn assign(
-        layouter: &mut impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
         advice_column: Column<Advice>,
         value: HashOut,
     ) -> Result<Self, Error> {
         let result = AssignedHashOut {
             elements: value
                 .elements
-                .map(|v| AssignedGoldilocksField::assign(layouter, advice_column, v).unwrap()),
+                .to_vec()
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    AssignedGoldilocksField::assign(
+                        layouter.namespace(|| format!("assign hash out element[{i}]")),
+                        advice_column,
+                        *v,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
         };
 
         Ok(result)
@@ -200,7 +246,7 @@ pub struct AssignedMerkleProof {
 
 impl AssignedMerkleProof {
     pub fn assign(
-        layouter: &mut impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
         advice_column: Column<Advice>,
         value: &MerkleProof,
     ) -> Result<Self, Error> {
@@ -208,7 +254,13 @@ impl AssignedMerkleProof {
             siblings: value
                 .siblings
                 .iter()
-                .map(|sibling| AssignedHashOut::assign(layouter, advice_column, *sibling))
+                .map(|sibling| {
+                    AssignedHashOut::assign(
+                        layouter.namespace(|| "assign sibling"),
+                        advice_column,
+                        *sibling,
+                    )
+                })
                 .collect::<Result<Vec<_>, Error>>()?,
         };
 
@@ -267,10 +319,18 @@ impl AssignedFriInitialTreeProof {
                         evals
                             .iter()
                             .map(|eval| {
-                                AssignedGoldilocksField::assign(layouter, advice_column, *eval)
+                                AssignedGoldilocksField::assign(
+                                    layouter.namespace(|| "assign eval"),
+                                    advice_column,
+                                    *eval,
+                                )
                             })
                             .collect::<Result<Vec<_>, Error>>()?,
-                        AssignedMerkleProof::assign(layouter, advice_column, proof)?,
+                        AssignedMerkleProof::assign(
+                            layouter.namespace(|| "assign proof"),
+                            advice_column,
+                            proof,
+                        )?,
                     ))
                 })
                 .collect::<Result<Vec<_>, Error>>()?,
@@ -386,7 +446,6 @@ pub fn fri_combine_initial(
 
 pub fn fri_combine_initial_assigned(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     advice_column: Column<Advice>,
     instance: &AssignedFriInstanceInfo,
@@ -429,30 +488,21 @@ pub fn fri_combine_initial_assigned(
             .collect::<Vec<_>>();
         let reduced_evals = alpha.reduce(
             layouter.namespace(|| "reduce"),
-            gate,
             range,
             advice_column,
             &evals,
         );
         let tmp = neg_extension(
             layouter.namespace(|| "neg1"),
-            gate,
             range,
             reduced_openings.clone(),
         )
         .unwrap();
-        let numerator = add_extension(
-            layouter.namespace(|| "add1"),
-            gate,
-            range,
-            reduced_evals,
-            tmp,
-        )
-        .unwrap();
-        let tmp = neg_extension(layouter.namespace(|| "neg2"), gate, range, point.clone()).unwrap();
+        let numerator =
+            add_extension(layouter.namespace(|| "add1"), range, reduced_evals, tmp).unwrap();
+        let tmp = neg_extension(layouter.namespace(|| "neg2"), range, point.clone()).unwrap();
         let denominator = add_extension(
             layouter.namespace(|| "add2"),
-            gate,
             range,
             subgroup_x.clone(),
             tmp,
@@ -460,20 +510,13 @@ pub fn fri_combine_initial_assigned(
         .unwrap();
         sum = alpha.shift(
             layouter.namespace(|| "shift alpha by sum"),
-            gate,
             range,
             advice_column,
             sum,
         );
-        let tmp = div_extension(
-            layouter.namespace(|| "div"),
-            gate,
-            range,
-            numerator,
-            denominator,
-        )
-        .unwrap();
-        sum = add_extension(layouter.namespace(|| "add"), gate, range, sum, tmp).unwrap();
+        let tmp =
+            div_extension(layouter.namespace(|| "div"), range, numerator, denominator).unwrap();
+        sum = add_extension(layouter.namespace(|| "add"), range, sum, tmp).unwrap();
     }
 
     Ok(sum)
@@ -484,12 +527,10 @@ mod tests {
     use std::io::Read;
 
     use halo2_base::{
-        gates::{range::RangeStrategy, RangeInstructions},
+        gates::range::RangeStrategy,
         halo2_proofs::{circuit::SimpleFloorPlanner, dev::MockProver, plonk::Circuit},
     };
     use plonky2::plonk::circuit_data::CircuitConfig;
-
-    use crate::utils::assign_val;
 
     use super::*;
 
@@ -573,7 +614,6 @@ mod tests {
             mut layouter: impl Layouter<Fr>,
         ) -> Result<(), Error> {
             let range = &config.range;
-            let gate = range.gate();
             let advice_column = config.a;
 
             let mut file = std::fs::File::open("fri-initial-proof.json").unwrap();
@@ -588,38 +628,37 @@ mod tests {
             file.read_to_string(&mut raw_contents).unwrap();
             let precomputed_reduced_evals: PrecomputedReducedOpenings =
                 serde_json::from_str(&raw_contents).unwrap();
-            let precomputed_reduced_evals_assigned = AssignedPrecomputedReducedOpenings {
-                reduced_openings_at_point: precomputed_reduced_evals
-                    .reduced_openings_at_point
-                    .iter()
-                    .map(|x| AssignedGoldilocksExtension::assign(&mut layouter, advice_column, *x))
-                    .collect::<Result<Vec<_>, Error>>()?,
-            };
+            let precomputed_reduced_evals_assigned = AssignedPrecomputedReducedOpenings::assign(
+                layouter.namespace(|| "assign precomputed reduced evals"),
+                advice_column,
+                &precomputed_reduced_evals,
+            )?;
 
             let mut file = std::fs::File::open("fri-instance.json").unwrap();
             let mut raw_contents = String::new();
             file.read_to_string(&mut raw_contents).unwrap();
             let instance: FriInstanceInfo = serde_json::from_str(&raw_contents).unwrap();
-            let instance_assigned =
-                AssignedFriInstanceInfo::assign(&mut layouter, advice_column, &instance)?;
+            let instance_assigned = AssignedFriInstanceInfo::assign(
+                layouter.namespace(|| "assign instance"),
+                advice_column,
+                &instance,
+            )?;
 
             let alpha = GoldilocksExtension([
                 serde_json::from_str("10996128681446358693").unwrap(),
                 serde_json::from_str("6817592260154284178").unwrap(),
             ]);
-            let alpha_assigned = AssignedGoldilocksExtension([
-                assign_val(layouter.namespace(|| "alpha[0]"), advice_column, *alpha[0]).unwrap(),
-                assign_val(layouter.namespace(|| "alpha[1]"), advice_column, *alpha[1]).unwrap(),
-            ]);
+            let alpha_assigned = AssignedGoldilocksExtension::assign(
+                layouter.namespace(|| "assign alpha"),
+                advice_column,
+                alpha,
+            )?;
             let subgroup_x: GoldilocksField = serde_json::from_str("123358979586301028").unwrap();
-            let subgroup_x_assigned = AssignedGoldilocksField(
-                assign_val(
-                    layouter.namespace(|| "subgroup_x"),
-                    advice_column,
-                    *subgroup_x,
-                )
-                .unwrap(),
-            );
+            let subgroup_x_assigned = AssignedGoldilocksField::assign(
+                layouter.namespace(|| "subgroup_x"),
+                advice_column,
+                subgroup_x,
+            )?;
             let sum = GoldilocksExtension([
                 serde_json::from_str("17703852102747170808").unwrap(),
                 serde_json::from_str("9208250178161818572").unwrap(),
@@ -631,7 +670,6 @@ mod tests {
             let params = fri_config.fri_params(degree_bits, false);
             let output_assigned = fri_combine_initial_assigned(
                 layouter,
-                gate,
                 range,
                 advice_column,
                 &instance_assigned,

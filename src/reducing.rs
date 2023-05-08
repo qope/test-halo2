@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
 
 use halo2_base::{
-    gates::{flex_gate::FlexGateConfig, range::RangeConfig},
+    gates::range::RangeConfig,
     halo2_proofs::{
         circuit::Layouter,
         halo2curves::bn256::Fr,
@@ -61,14 +61,12 @@ impl AssignedReducingFactor {
     pub fn reduce(
         &mut self,
         mut layouter: impl Layouter<Fr>,
-        gate: &FlexGateConfig<Fr>,
         range: &RangeConfig<Fr>,
         advice_column: Column<Advice>,
         terms: &[AssignedGoldilocksExtension], // Could probably work with a `DoubleEndedIterator` too.
     ) -> AssignedGoldilocksExtension {
         self.reduce_arithmetic(
             layouter.namespace(|| "reduce arithmetic"),
-            gate,
             range,
             advice_column,
             terms,
@@ -78,14 +76,12 @@ impl AssignedReducingFactor {
     pub fn shift(
         &mut self,
         mut layouter: impl Layouter<Fr>,
-        gate: &FlexGateConfig<Fr>,
         range: &RangeConfig<Fr>,
         advice_column: Column<Advice>,
         x: AssignedGoldilocksExtension,
     ) -> AssignedGoldilocksExtension {
         let exp = exp_u64_extension(
             layouter.namespace(|| "exp"),
-            gate,
             range,
             advice_column,
             self.base.clone(),
@@ -94,21 +90,13 @@ impl AssignedReducingFactor {
         .unwrap();
 
         self.count = 0;
-        mul_extension(
-            layouter.namespace(|| "multiply exp by x"),
-            gate,
-            range,
-            exp,
-            x,
-        )
-        .unwrap()
+        mul_extension(layouter.namespace(|| "multiply exp by x"), range, exp, x).unwrap()
     }
 
     /// Reduces a vector of `ExtensionTarget`s using `ArithmeticGate`s.
     fn reduce_arithmetic(
         &mut self,
         mut layouter: impl Layouter<Fr>,
-        gate: &FlexGateConfig<Fr>,
         range: &RangeConfig<Fr>,
         advice_column: Column<Advice>,
         terms: &[AssignedGoldilocksExtension],
@@ -119,15 +107,10 @@ impl AssignedReducingFactor {
             AssignedGoldilocksExtension([zero.clone(), zero]),
             |acc, et| {
                 // builder.mul_add_extension(self.base, acc, et)
-                let tmp = mul_extension(
-                    layouter.namespace(|| "mul"),
-                    gate,
-                    range,
-                    self.base.clone(),
-                    acc,
-                )
-                .unwrap();
-                add_extension(layouter.namespace(|| ""), gate, range, tmp, et.clone()).unwrap()
+                let tmp =
+                    mul_extension(layouter.namespace(|| "mul"), range, self.base.clone(), acc)
+                        .unwrap();
+                add_extension(layouter.namespace(|| "add"), range, tmp, et.clone()).unwrap()
             },
         )
     }

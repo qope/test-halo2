@@ -4,7 +4,7 @@ use std::{
 };
 
 use halo2_base::{
-    gates::{flex_gate::FlexGateConfig, range::RangeConfig, GateInstructions, RangeInstructions},
+    gates::{range::RangeConfig, GateInstructions, RangeInstructions},
     halo2_proofs::{
         circuit::{AssignedCell, Layouter, Value},
         halo2curves::bn256::Fr,
@@ -166,7 +166,7 @@ impl From<AssignedCell<Fr, Fr>> for AssignedGoldilocksField {
 
 impl AssignedGoldilocksField {
     pub fn assign(
-        layouter: &mut impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
         advice_column: Column<Advice>,
         value: GoldilocksField,
     ) -> Result<Self, Error> {
@@ -474,7 +474,7 @@ impl From<[AssignedCell<Fr, Fr>; 2]> for AssignedGoldilocksExtension {
 
 impl AssignedGoldilocksExtension {
     pub fn assign(
-        layouter: &mut impl Layouter<Fr>,
+        mut layouter: impl Layouter<Fr>,
         advice_column: Column<Advice>,
         x: GoldilocksExtension,
     ) -> Result<Self, Error> {
@@ -540,11 +540,11 @@ const K: usize = 18;
 /// Constrain `output = a + b`.
 pub fn add_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     a: AssignedGoldilocksExtension,
     b: AssignedGoldilocksExtension,
 ) -> Result<AssignedGoldilocksExtension, Error> {
+    let gate = range.gate();
     let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output0_assigned = RefCell::new(None);
@@ -633,7 +633,6 @@ pub fn add_extension(
 
     let output0 = mod_by_goldilocks_order(
         layouter.namespace(|| "output0 mod order"),
-        gate,
         range,
         output0_assigned.into_inner().unwrap(),
     )
@@ -641,7 +640,6 @@ pub fn add_extension(
 
     let output1 = mod_by_goldilocks_order(
         layouter.namespace(|| "output1 mod order"),
-        gate,
         range,
         output1_assigned.into_inner().unwrap(),
     )
@@ -653,25 +651,15 @@ pub fn add_extension(
 /// Constrain `output = -a`.
 pub fn neg_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     a: AssignedGoldilocksExtension,
 ) -> Result<AssignedGoldilocksExtension, Error> {
-    let a0 = mod_by_goldilocks_order(
-        layouter.namespace(|| "a0 mod order"),
-        gate,
-        range,
-        a[0].clone(),
-    )
-    .unwrap();
+    let gate = range.gate();
+    let a0 = mod_by_goldilocks_order(layouter.namespace(|| "a0 mod order"), range, a[0].clone())
+        .unwrap();
 
-    let a1 = mod_by_goldilocks_order(
-        layouter.namespace(|| "a1 mod order"),
-        gate,
-        range,
-        a[1].clone(),
-    )
-    .unwrap();
+    let a1 = mod_by_goldilocks_order(layouter.namespace(|| "a1 mod order"), range, a[1].clone())
+        .unwrap();
 
     let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output0_assigned = RefCell::new(None);
@@ -754,11 +742,11 @@ pub fn neg_extension(
 /// Constrain `output = a * b`.
 pub fn mul_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     a: AssignedGoldilocksExtension,
     b: AssignedGoldilocksExtension,
 ) -> Result<AssignedGoldilocksExtension, Error> {
+    let gate = range.gate();
     let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output0_assigned = RefCell::new(None);
@@ -866,7 +854,6 @@ pub fn mul_extension(
 
     let output0 = mod_by_goldilocks_order(
         layouter.namespace(|| "output0 mod order"),
-        gate,
         range,
         output0_assigned.into_inner().unwrap(),
     )
@@ -874,7 +861,6 @@ pub fn mul_extension(
 
     let output1 = mod_by_goldilocks_order(
         layouter.namespace(|| "output0 mod order"),
-        gate,
         range,
         output1_assigned.into_inner().unwrap(),
     )
@@ -889,16 +875,11 @@ pub fn mul_extension(
 /// Constrain `output = a / b`.
 pub fn div_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     a: AssignedGoldilocksExtension,
     b: AssignedGoldilocksExtension,
 ) -> Result<AssignedGoldilocksExtension, Error> {
-    // let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    // let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    // let output0_assigned = RefCell::new(None);
-    // let output1_assigned = RefCell::new(None);
-    // let mut expected_a = RefCell::new(None);
+    let gate = range.gate();
     let output = RefCell::new(None);
 
     layouter.assign_region(
@@ -949,7 +930,6 @@ pub fn div_extension(
     let output_assigned = output.into_inner().unwrap();
     let expected_a_assigned = mul_extension(
         layouter.namespace(|| "mul"),
-        gate,
         range,
         output_assigned.clone(),
         b,
@@ -971,21 +951,20 @@ pub fn div_extension(
 /// Constrain `output = a * b`.
 pub fn square_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     a: AssignedGoldilocksExtension,
 ) -> Result<AssignedGoldilocksExtension, Error> {
-    mul_extension(layouter.namespace(|| "mul"), gate, range, a.clone(), a)
+    mul_extension(layouter.namespace(|| "mul"), range, a.clone(), a)
 }
 
 /// Constrain `output = a * scalar`.
 pub fn constant_scalar_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     scalar: Fr,
     value: AssignedGoldilocksExtension,
 ) -> Result<AssignedGoldilocksExtension, Error> {
+    let gate = range.gate();
     let value_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output0_assigned = RefCell::new(None);
     let output1_assigned = RefCell::new(None);
@@ -1067,7 +1046,6 @@ pub fn constant_scalar_extension(
 
     let output0 = mod_by_goldilocks_order(
         layouter.namespace(|| "output0 mod order"),
-        gate,
         range,
         output0_assigned.into_inner().unwrap(),
     )
@@ -1075,7 +1053,6 @@ pub fn constant_scalar_extension(
 
     let output1 = mod_by_goldilocks_order(
         layouter.namespace(|| "output1 mod order"),
-        gate,
         range,
         output1_assigned.into_inner().unwrap(),
     )
@@ -1086,7 +1063,6 @@ pub fn constant_scalar_extension(
 
 pub fn scalar_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     advice_column: Column<Advice>,
     scalar: AssignedCell<Fr, Fr>,
@@ -1095,13 +1071,12 @@ pub fn scalar_extension(
     let zero = zero_assigned(layouter.namespace(|| "assign zero"), advice_column).unwrap();
     let b = AssignedGoldilocksExtension([scalar, zero]);
 
-    mul_extension(layouter, gate, range, value, b)
+    mul_extension(layouter, range, value, b)
 }
 
 /// Constrain `output = constant0 * multiplicand0 * multiplicand1 + constant1 * addend`.
 pub fn arithmetic_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     constant0: Fr,
     constant1: Fr,
@@ -1111,36 +1086,29 @@ pub fn arithmetic_extension(
 ) -> Result<AssignedGoldilocksExtension, Error> {
     let tmp0 = mul_extension(
         layouter.namespace(|| "multiplication"),
-        gate,
         range,
         multiplicand0,
         multiplicand1,
     )?;
-    let tmp0 = constant_scalar_extension(
-        layouter.namespace(|| "first term"),
-        gate,
-        range,
-        constant0,
-        tmp0,
-    )?;
+    let tmp0 =
+        constant_scalar_extension(layouter.namespace(|| "first term"), range, constant0, tmp0)?;
     let tmp1 = constant_scalar_extension(
         layouter.namespace(|| "second term"),
-        gate,
         range,
         constant1,
         addend,
     )?;
 
-    add_extension(layouter, gate, range, tmp0, tmp1)
+    add_extension(layouter, range, tmp0, tmp1)
 }
 
 /// Constrain `output = a % GOLDILOCKS_FIELD_ORDER`.
 pub fn mod_by_goldilocks_order(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     a: AssignedCell<Fr, Fr>,
 ) -> Result<AssignedCell<Fr, Fr>, Error> {
+    let gate = range.gate();
     let a_assigned = RefCell::new(None);
     let output_assigned = RefCell::new(None);
 
@@ -1246,7 +1214,6 @@ pub fn mod_by_goldilocks_order(
 
 pub fn exp_u64_extension(
     mut layouter: impl Layouter<Fr>,
-    gate: &FlexGateConfig<Fr>,
     range: &RangeConfig<Fr>,
     advice_column: Column<Advice>,
     base: AssignedGoldilocksExtension,
@@ -1261,17 +1228,11 @@ pub fn exp_u64_extension(
 
     for j in 0..bits_u64(power) {
         if j != 0 {
-            current = square_extension(
-                layouter.namespace(|| "square"),
-                gate,
-                range,
-                current.clone(),
-            )?;
+            current = square_extension(layouter.namespace(|| "square"), range, current.clone())?;
         }
         if (power >> j & 1) != 0 {
             product = mul_extension(
                 layouter.namespace(|| "mul"),
-                gate,
                 range,
                 product,
                 current.clone(),
@@ -1327,7 +1288,6 @@ mod tests {
             mut layouter: impl Layouter<Fr>,
         ) -> Result<(), Error> {
             let range = &config.range;
-            let gate = range.gate();
             let a = config.a;
 
             let value00 = Fr::from(1);
@@ -1337,30 +1297,27 @@ mod tests {
             let output0 = Fr::from(181);
             let output1 = Fr::from(38);
 
-            let value00_assigned =
-                assign_val(layouter.namespace(|| "value00"), a, value00).unwrap();
-            let value01_assigned =
-                assign_val(layouter.namespace(|| "value01"), a, value01).unwrap();
-            let value10_assigned =
-                assign_val(layouter.namespace(|| "value10"), a, value10).unwrap();
-            let value11_assigned =
-                assign_val(layouter.namespace(|| "value11"), a, value11).unwrap();
-            let value0 = AssignedGoldilocksExtension([value00_assigned, value01_assigned]);
-            let value1 = AssignedGoldilocksExtension([value10_assigned, value11_assigned]);
+            let value0 = AssignedGoldilocksExtension::assign(
+                layouter.namespace(|| "assign value0"),
+                a,
+                [value00.into(), value01.into()].into(),
+            )?;
+            let value1 = AssignedGoldilocksExtension::assign(
+                layouter.namespace(|| "assign value1"),
+                a,
+                [value10.into(), value11.into()].into(),
+            )?;
 
             // [181, 38] = 3 * [1, 2] * [3, 4] + 4 * [1, 2] = 3 * [59, 10] + [4, 8] = [177, 30] + [4, 8]
             let output_assigned = arithmetic_extension(
                 layouter,
-                gate,
                 range,
                 value10,
                 value11,
                 value0.clone(),
                 value1,
                 value0,
-            )
-            .unwrap();
-            dbg!(&output_assigned);
+            )?;
             output_assigned[0]
                 .value()
                 .assert_if_known(|&&x| x == output0);
