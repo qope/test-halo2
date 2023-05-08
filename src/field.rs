@@ -22,6 +22,7 @@ use plonky2::{
     },
     util::bits_u64,
 };
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::utils::{assign_val, convert_big_uint_to_fr, convert_fr_to_big_uint};
 
@@ -29,6 +30,40 @@ const GOLDILOCKS_FIELD_ORDER: u64 = 18446744069414584321;
 
 #[derive(Copy, Clone, Debug)]
 pub struct GoldilocksField(pub(crate) Fr);
+
+impl Deref for GoldilocksField {
+    type Target = Fr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for GoldilocksField {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = u64::from_le_bytes(self.0.to_bytes()[..8].try_into().unwrap());
+
+        SerilizableGoldilocksField(value).serialize(serializer)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct SerilizableGoldilocksField(pub u64);
+
+impl<'de> Deserialize<'de> for GoldilocksField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = SerilizableGoldilocksField::deserialize(deserializer)?;
+
+        Ok(GoldilocksField(Fr::from(value.0)))
+    }
+}
 
 impl<'a> PartialEq<GoldilocksField> for &'a GoldilocksField {
     fn eq(&self, other: &GoldilocksField) -> bool {
@@ -115,25 +150,53 @@ impl From<Fr> for GoldilocksField {
 #[derive(Clone, Debug)]
 pub struct AssignedGoldilocksField(pub(crate) AssignedCell<Fr, Fr>);
 
-#[derive(Copy, Clone, Debug)]
-pub struct GoldilocksExtension(pub(crate) [Fr; 2]);
-
-impl Deref for GoldilocksExtension {
-    type Target = [Fr; 2];
+impl Deref for AssignedGoldilocksField {
+    type Target = AssignedCell<Fr, Fr>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl From<[Fr; 2]> for GoldilocksExtension {
-    fn from(value: [Fr; 2]) -> Self {
-        let value0_bi = convert_fr_to_big_uint(value[0]) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
+impl From<AssignedCell<Fr, Fr>> for AssignedGoldilocksField {
+    fn from(value: AssignedCell<Fr, Fr>) -> Self {
+        Self(value)
+    }
+}
+
+impl AssignedGoldilocksField {
+    pub fn assign(
+        layouter: &mut impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        value: GoldilocksField,
+    ) -> Result<Self, Error> {
+        let result = assign_val(layouter.namespace(|| "assign value"), advice_column, *value)
+            .unwrap()
+            .into();
+
+        Ok(result)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GoldilocksExtension(pub(crate) [GoldilocksField; 2]);
+
+impl Deref for GoldilocksExtension {
+    type Target = [GoldilocksField; 2];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<[GoldilocksField; 2]> for GoldilocksExtension {
+    fn from(value: [GoldilocksField; 2]) -> Self {
+        let value0_bi = convert_fr_to_big_uint(value[0].0) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let value0_fr = convert_big_uint_to_fr(value0_bi);
-        let value1_bi = convert_fr_to_big_uint(value[1]) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
+        let value1_bi = convert_fr_to_big_uint(value[1].0) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let value1_fr = convert_big_uint_to_fr(value1_bi);
 
-        Self([value0_fr, value1_fr])
+        Self([value0_fr.into(), value1_fr.into()])
     }
 }
 
@@ -161,15 +224,15 @@ impl<'a, 'b> Sub<&'b GoldilocksExtension> for &'a GoldilocksExtension {
     #[inline]
     fn sub(self, rhs: &'b GoldilocksExtension) -> GoldilocksExtension {
         // output0 = a0 + b0
-        let output0 = Fr::from(GOLDILOCKS_FIELD_ORDER) + self[0] - rhs[0];
+        let output0 = Fr::from(GOLDILOCKS_FIELD_ORDER) + self[0].0 - rhs[0].0;
         let output0_bi = convert_fr_to_big_uint(output0) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let output0_fr = convert_big_uint_to_fr(output0_bi);
         // output1 = a1 + b1
-        let output1 = Fr::from(GOLDILOCKS_FIELD_ORDER) + self[1] - rhs[1];
+        let output1 = Fr::from(GOLDILOCKS_FIELD_ORDER) + self[1].0 - rhs[1].0;
         let output1_bi = convert_fr_to_big_uint(output1) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let output1_fr = convert_big_uint_to_fr(output1_bi);
 
-        GoldilocksExtension([output0_fr, output1_fr])
+        GoldilocksExtension([output0_fr.into(), output1_fr.into()])
     }
 }
 
@@ -197,15 +260,15 @@ impl<'a, 'b> Add<&'b GoldilocksExtension> for &'a GoldilocksExtension {
     #[inline]
     fn add(self, rhs: &'b GoldilocksExtension) -> GoldilocksExtension {
         // output0 = a0 + b0
-        let output0 = self[0] + rhs[0];
+        let output0 = self[0].0 + rhs[0].0;
         let output0_bi = convert_fr_to_big_uint(output0) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let output0_fr = convert_big_uint_to_fr(output0_bi);
         // output1 = a1 + b1
-        let output1 = self[1] + rhs[1];
+        let output1 = self[1].0 + rhs[1].0;
         let output1_bi = convert_fr_to_big_uint(output1) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let output1_fr = convert_big_uint_to_fr(output1_bi);
 
-        GoldilocksExtension([output0_fr, output1_fr])
+        GoldilocksExtension([output0_fr.into(), output1_fr.into()])
     }
 }
 
@@ -246,15 +309,15 @@ impl<'a, 'b> Mul<&'b GoldilocksExtension> for &'a GoldilocksExtension {
     fn mul(self, rhs: &'b GoldilocksExtension) -> GoldilocksExtension {
         // output0 = a0 * b0 + W * a1 * b1
         let w = Fr::from(7);
-        let output0 = self[0] * rhs[0] + w * self[1] * rhs[1];
+        let output0 = self[0].0 * rhs[0].0 + w * self[1].0 * rhs[1].0;
         let output0_bi = convert_fr_to_big_uint(output0) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let output0_fr = convert_big_uint_to_fr(output0_bi);
         // output1 = a0 * b1 + a1 * b0
-        let output1 = self[0] * rhs[1] + self[1] * rhs[0];
+        let output1 = self[0].0 * rhs[1].0 + self[1].0 * rhs[0].0;
         let output1_bi = convert_fr_to_big_uint(output1) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
         let output1_fr = convert_big_uint_to_fr(output1_bi);
 
-        GoldilocksExtension([output0_fr, output1_fr])
+        GoldilocksExtension([output0_fr.into(), output1_fr.into()])
     }
 }
 
@@ -280,15 +343,15 @@ impl<'a, 'b> Div<&'b GoldilocksExtension> for &'a GoldilocksExtension {
     type Output = GoldilocksExtension;
 
     fn div(self, rhs: &'b GoldilocksExtension) -> Self::Output {
-        let lhs0_bi = convert_fr_to_big_uint(self[0]);
+        let lhs0_bi = convert_fr_to_big_uint(self[0].0);
         let lhs0 = GoldilocksFieldOriginal::from_noncanonical_biguint(lhs0_bi);
-        let lhs1_bi = convert_fr_to_big_uint(self[1]);
+        let lhs1_bi = convert_fr_to_big_uint(self[1].0);
         let lhs1 = GoldilocksFieldOriginal::from_noncanonical_biguint(lhs1_bi);
         let lhs = QuadraticExtension::<GoldilocksFieldOriginal>([lhs0, lhs1]);
 
-        let rhs0_bi = convert_fr_to_big_uint(rhs[0]);
+        let rhs0_bi = convert_fr_to_big_uint(rhs[0].0);
         let rhs0 = GoldilocksFieldOriginal::from_noncanonical_biguint(rhs0_bi);
-        let rhs1_bi = convert_fr_to_big_uint(rhs[1]);
+        let rhs1_bi = convert_fr_to_big_uint(rhs[1].0);
         let rhs1 = GoldilocksFieldOriginal::from_noncanonical_biguint(rhs1_bi);
         let rhs = QuadraticExtension::<GoldilocksFieldOriginal>([rhs0, rhs1]);
 
@@ -301,7 +364,7 @@ impl<'a, 'b> Div<&'b GoldilocksExtension> for &'a GoldilocksExtension {
         let result0_fr = convert_big_uint_to_fr(result0_bi);
         let result1_fr = convert_big_uint_to_fr(result1_bi);
 
-        GoldilocksExtension([result0_fr, result1_fr])
+        GoldilocksExtension([result0_fr.into(), result1_fr.into()])
     }
 }
 
@@ -328,9 +391,9 @@ impl Inv for GoldilocksExtension {
 
     fn inv(self) -> Self::Output {
         let value_fr = self.0;
-        let value0_bi = convert_fr_to_big_uint(value_fr[0]);
+        let value0_bi = convert_fr_to_big_uint(value_fr[0].0);
         let value0 = GoldilocksFieldOriginal::from_noncanonical_biguint(value0_bi);
-        let value1_bi = convert_fr_to_big_uint(value_fr[1]);
+        let value1_bi = convert_fr_to_big_uint(value_fr[1].0);
         let value1 = GoldilocksFieldOriginal::from_noncanonical_biguint(value1_bi);
         let value = QuadraticExtension::<GoldilocksFieldOriginal>([value0, value1]);
         let value_inv = value.inverse();
@@ -341,16 +404,16 @@ impl Inv for GoldilocksExtension {
         let value_inv0_fr = convert_big_uint_to_fr(value_inv0_bi);
         let value_inv1_fr = convert_big_uint_to_fr(value_inv1_bi);
 
-        GoldilocksExtension([value_inv0_fr, value_inv1_fr])
+        GoldilocksExtension([value_inv0_fr.into(), value_inv1_fr.into()])
     }
 }
 
 impl GoldilocksExtension {
     pub fn exp_u64(&self, power: u64) -> Self {
         let value_fr = self.0;
-        let value0_bi = convert_fr_to_big_uint(value_fr[0]);
+        let value0_bi = convert_fr_to_big_uint(value_fr[0].0);
         let value0 = GoldilocksFieldOriginal::from_noncanonical_biguint(value0_bi);
-        let value1_bi = convert_fr_to_big_uint(value_fr[1]);
+        let value1_bi = convert_fr_to_big_uint(value_fr[1].0);
         let value1 = GoldilocksFieldOriginal::from_noncanonical_biguint(value1_bi);
         let value = QuadraticExtension::<GoldilocksFieldOriginal>([value0, value1]);
 
@@ -363,19 +426,19 @@ impl GoldilocksExtension {
         let result0_fr = convert_big_uint_to_fr(result0_bi);
         let result1_fr = convert_big_uint_to_fr(result1_bi);
 
-        GoldilocksExtension([result0_fr, result1_fr])
+        GoldilocksExtension([result0_fr.into(), result1_fr.into()])
     }
 }
 
-impl From<Fr> for GoldilocksExtension {
-    fn from(value: Fr) -> Self {
-        Self([value, Fr::zero()])
+impl From<GoldilocksField> for GoldilocksExtension {
+    fn from(value: GoldilocksField) -> Self {
+        Self([value, Fr::zero().into()])
     }
 }
 
 impl GoldilocksExtension {
     pub fn zero() -> Self {
-        Self([Fr::zero(); 2])
+        Self([Fr::zero().into(); 2])
     }
 }
 
@@ -403,6 +466,35 @@ impl Deref for AssignedGoldilocksExtension {
     }
 }
 
+impl From<[AssignedCell<Fr, Fr>; 2]> for AssignedGoldilocksExtension {
+    fn from(value: [AssignedCell<Fr, Fr>; 2]) -> Self {
+        Self(value)
+    }
+}
+
+impl AssignedGoldilocksExtension {
+    pub fn assign(
+        layouter: &mut impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        x: GoldilocksExtension,
+    ) -> Result<Self, Error> {
+        let result = Self([
+            assign_val(
+                layouter.namespace(|| "reduced_openings_at_point[0]"),
+                advice_column,
+                *x[0],
+            )?,
+            assign_val(
+                layouter.namespace(|| "reduced_openings_at_point[1]"),
+                advice_column,
+                *x[1],
+            )?,
+        ]);
+
+        Ok(result)
+    }
+}
+
 impl AssignedGoldilocksExtension {
     pub fn zero(
         mut layouter: impl Layouter<Fr>,
@@ -421,12 +513,12 @@ impl AssignedGoldilocksExtension {
         let constant0_cell = assign_val(
             layouter.namespace(|| "assign constant"),
             advice_column,
-            val[0],
+            val[0].0,
         )?;
         let constant1_cell = assign_val(
             layouter.namespace(|| "assign constant"),
             advice_column,
-            val[1],
+            val[1].0,
         )?;
 
         Ok(Self([constant0_cell, constant1_cell]))
@@ -565,11 +657,21 @@ pub fn neg_extension(
     range: &RangeConfig<Fr>,
     a: AssignedGoldilocksExtension,
 ) -> Result<AssignedGoldilocksExtension, Error> {
-    let a0 =
-        mod_by_goldilocks_order(layouter.namespace(|| "a0 mod order"), gate, range, a[0].clone()).unwrap();
+    let a0 = mod_by_goldilocks_order(
+        layouter.namespace(|| "a0 mod order"),
+        gate,
+        range,
+        a[0].clone(),
+    )
+    .unwrap();
 
-    let a1 =
-        mod_by_goldilocks_order(layouter.namespace(|| "a1 mod order"), gate, range, a[1].clone()).unwrap();
+    let a1 = mod_by_goldilocks_order(
+        layouter.namespace(|| "a1 mod order"),
+        gate,
+        range,
+        a[1].clone(),
+    )
+    .unwrap();
 
     let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
     let output0_assigned = RefCell::new(None);
@@ -815,7 +917,7 @@ pub fn div_extension(
                 let a_raws = RefCell::new(vec![]);
                 a.0.iter().for_each(|a_i| {
                     a_i.value().map(|a_i_raw| {
-                        a_raws.borrow_mut().push(*a_i_raw);
+                        a_raws.borrow_mut().push((*a_i_raw).into());
                     });
                 });
 
@@ -825,7 +927,7 @@ pub fn div_extension(
                 let b_raws = RefCell::new(vec![]);
                 b.0.iter().for_each(|b_i| {
                     b_i.value().map(|b_i_raw| {
-                        b_raws.borrow_mut().push(*b_i_raw);
+                        b_raws.borrow_mut().push((*b_i_raw).into());
                     });
                 });
 
@@ -833,8 +935,8 @@ pub fn div_extension(
             };
 
             let output_raw = a_raw / b_raw;
-            let output0 = gate.load_witness(&mut ctx, Value::known(output_raw[0]));
-            let output1 = gate.load_witness(&mut ctx, Value::known(output_raw[1]));
+            let output0 = gate.load_witness(&mut ctx, Value::known(output_raw[0].0));
+            let output1 = gate.load_witness(&mut ctx, Value::known(output_raw[1].0));
             let output0_assigned = AssignedCell::new(output0.value, output0.cell);
             let output1_assigned = AssignedCell::new(output1.value, output1.cell);
             let output_assigned = AssignedGoldilocksExtension([output0_assigned, output1_assigned]);
@@ -1154,15 +1256,26 @@ pub fn exp_u64_extension(
     let mut product = AssignedGoldilocksExtension::constant(
         layouter.namespace(|| "assign one"),
         advice_column,
-        GoldilocksExtension([Fr::one(), Fr::zero()]),
+        GoldilocksExtension([Fr::one().into(), Fr::zero().into()]),
     )?;
 
     for j in 0..bits_u64(power) {
         if j != 0 {
-            current = square_extension(layouter.namespace(|| "square"), gate, range, current.clone())?;
+            current = square_extension(
+                layouter.namespace(|| "square"),
+                gate,
+                range,
+                current.clone(),
+            )?;
         }
         if (power >> j & 1) != 0 {
-            product = mul_extension(layouter.namespace(|| "mul"), gate, range, product, current.clone())?;
+            product = mul_extension(
+                layouter.namespace(|| "mul"),
+                gate,
+                range,
+                product,
+                current.clone(),
+            )?;
         }
     }
 
