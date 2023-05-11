@@ -1,3 +1,5 @@
+// use std::borrow::Borrow;
+
 use halo2_base::{
     gates::{
         flex_gate::{FlexGateConfig, GateStrategy},
@@ -9,7 +11,15 @@ use halo2_base::{
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     },
 };
-use plonky2::fri::FriParams;
+use plonky2::{
+    // field::{
+    //     extension::quadratic::QuadraticExtension,
+    //     goldilocks_field::GoldilocksField as GoldilocksFieldOriginal,
+    //     types::{Field, PrimeField},
+    // },
+    fri::FriParams,
+    // util::{bits_u64, reverse_index_bits_in_place},
+};
 use poseidon_circuit::poseidon::{primitives::P128Pow5T3, Pow5Chip, Pow5Config};
 use serde::{Deserialize, Serialize};
 
@@ -356,58 +366,6 @@ impl AssignedFriInitialTreeProof {
     }
 }
 
-// #[derive(Debug, Clone, Eq, PartialEq)]
-// pub enum FriReductionStrategy {
-//     /// Specifies the exact sequence of arities (expressed in bits) to use.
-//     Fixed(Vec<usize>),
-
-//     /// `ConstantArityBits(arity_bits, final_poly_bits)` applies reductions of arity `2^arity_bits`
-//     /// until the polynomial degree is less than or equal to `2^final_poly_bits` or until any further
-//     /// `arity_bits`-reduction makes the last FRI tree have height less than `cap_height`.
-//     /// This tends to work well in the recursive setting, as it avoids needing multiple configurations
-//     /// of gates used in FRI verification, such as `InterpolationGate`.
-//     ConstantArityBits(usize, usize),
-
-//     /// `MinSize(opt_max_arity_bits)` searches for an optimal sequence of reduction arities, with an
-//     /// optional max `arity_bits`. If this proof will have recursive proofs on top of it, a max
-//     /// `arity_bits` of 3 is recommended.
-//     MinSize(Option<usize>),
-// }
-
-// #[derive(Debug, Clone, Eq, PartialEq)]
-// pub struct FriConfig {
-//     /// `rate = 2^{-rate_bits}`.
-//     pub rate_bits: usize,
-
-//     /// Height of Merkle tree caps.
-//     pub cap_height: usize,
-
-//     pub proof_of_work_bits: u32,
-
-//     pub reduction_strategy: FriReductionStrategy,
-
-//     /// Number of query rounds to perform.
-//     pub num_query_rounds: usize,
-// }
-
-// #[derive(Debug, Clone, Eq, PartialEq)]
-// pub struct FriParams {
-//     /// User-specified FRI configuration.
-//     pub config: FriConfig,
-
-//     /// Whether to use a hiding variant of Merkle trees (where random salts are added to leaves).
-//     pub hiding: bool,
-
-//     /// The degree of the purported codeword, measured in bits.
-//     pub degree_bits: usize,
-
-//     /// The arity of each FRI reduction step, expressed as the log2 of the actual arity.
-//     /// For example, `[3, 2, 1]` would describe a FRI reduction tree with 8-to-1 reduction, then
-//     /// a 4-to-1 reduction, then a 2-to-1 reduction. After these reductions, the reduced polynomial
-//     /// is sent directly.
-//     pub reduction_arity_bits: Vec<usize>,
-// }
-
 pub fn fri_combine_initial(
     instance: &FriInstanceInfo,
     proof: &FriInitialTreeProof,
@@ -526,13 +484,20 @@ pub fn fri_combine_initial_assigned(
 mod tests {
     use std::io::Read;
 
-    use halo2_base::{
-        gates::range::RangeStrategy,
-        halo2_proofs::{circuit::SimpleFloorPlanner, dev::MockProver, plonk::Circuit},
+    use halo2_base::{gates::range::RangeStrategy, halo2_proofs};
+    use halo2_proofs::{
+        circuit::{Layouter, SimpleFloorPlanner},
+        dev::MockProver,
+        halo2curves::bn256::Fr,
+        plonk::{Advice, Circuit, Column, Error},
     };
     use plonky2::plonk::circuit_data::CircuitConfig;
 
+    use crate::utils::{evm_verify, gen_evm_verifier, gen_pk, gen_proof, gen_srs};
+
     use super::*;
+
+    const K: usize = 18;
 
     #[test]
     fn test_fri_combine_initial() {
@@ -582,9 +547,10 @@ mod tests {
     pub struct MyConfig {
         a: Column<Advice>,
         range: RangeConfig<Fr>,
+        poseidon: Pow5Config<Fr, WIDTH, RATE>,
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     pub struct MyCircuit;
 
     impl Circuit<Fr> for MyCircuit {
@@ -598,14 +564,29 @@ mod tests {
         fn configure(
             meta: &mut halo2_base::halo2_proofs::plonk::ConstraintSystem<Fr>,
         ) -> Self::Config {
+            let state = (0..WIDTH).map(|_| meta.advice_column()).collect::<Vec<_>>();
+            let partial_sbox = meta.advice_column();
+    
+            let rc_a = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
+            let rc_b = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
+    
+            meta.enable_constant(rc_b[0]);
+    
+            let poseidon = Pow5Chip::configure::<P128Pow5T3<Fr>>(
+                meta,
+                state.try_into().unwrap(),
+                partial_sbox,
+                rc_a.try_into().unwrap(),
+                rc_b.try_into().unwrap(),
+            );
+
             let a = meta.advice_column();
             meta.enable_equality(a);
 
-            // let gate = FlexGateConfig::configure(meta, GateStrategy::Vertical, &[1], 1, 0, K);
             let range =
-                RangeConfig::configure(meta, RangeStrategy::Vertical, &[5], &[6], 1, 15, 0, K);
+                RangeConfig::configure(meta, RangeStrategy::Vertical, &[1], &[0], 1, 15, 0, K);
 
-            Self::Config { a, range }
+            Self::Config { a, range, poseidon }
         }
 
         fn synthesize(
@@ -693,9 +674,16 @@ mod tests {
 
     #[test]
     fn test_fri_combine_initial_circuit() {
+        let params = gen_srs(K as u32);
+
         let circuit = MyCircuit;
         MockProver::run(K as u32, &circuit, vec![])
             .unwrap()
             .assert_satisfied();
+        let pk = gen_pk(&params, &circuit);
+        let deployment_code = gen_evm_verifier(&params, pk.get_vk(), vec![0]);
+        let circuit_instances: Vec<Vec<Fr>> = vec![]; // circuit.instances()
+        let proof = gen_proof(K, &params, &pk, circuit, circuit_instances.clone());
+        evm_verify(deployment_code, circuit_instances, proof);
     }
 }

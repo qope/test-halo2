@@ -4,7 +4,7 @@ use std::{
 };
 
 use halo2_base::{
-    gates::{range::RangeConfig, GateInstructions, RangeInstructions},
+    gates::{flex_gate::FlexGateConfig, range::RangeConfig, GateInstructions, RangeInstructions},
     halo2_proofs::{
         circuit::{AssignedCell, Layouter, Value},
         halo2curves::bn256::Fr,
@@ -175,6 +175,26 @@ impl AssignedGoldilocksField {
             .into();
 
         Ok(result)
+    }
+}
+
+impl AssignedGoldilocksField {
+    /// Constrain `a == b`.
+    pub fn connect(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        other: Self,
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "constrain_equal self and other",
+            |mut region| {
+                region.constrain_equal(self.cell(), other.cell())?;
+
+                Ok(())
+            },
+        )?;
+
+        Ok(())
     }
 }
 
@@ -440,6 +460,10 @@ impl GoldilocksExtension {
     pub fn zero() -> Self {
         Self([Fr::zero().into(); 2])
     }
+
+    pub fn one() -> Self {
+        Self([Fr::one().into(), Fr::zero().into()])
+    }
 }
 
 pub fn zero_assigned(
@@ -523,6 +547,25 @@ impl AssignedGoldilocksExtension {
 
         Ok(Self([constant0_cell, constant1_cell]))
     }
+
+    /// Constrain `a == b`.
+    pub fn connect(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        other: Self,
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "constrain_equal self and other",
+            |mut region| {
+                region.constrain_equal(self[0].cell(), other[0].cell())?;
+                region.constrain_equal(self[1].cell(), other[1].cell())?;
+
+                Ok(())
+            },
+        )?;
+
+        Ok(())
+    }
 }
 
 pub fn from_base_field(
@@ -535,7 +578,7 @@ pub fn from_base_field(
     Ok(AssignedGoldilocksExtension([value, zero]))
 }
 
-const K: usize = 18;
+const K: usize = 12;
 
 /// Constrain `output = a + b`.
 pub fn add_extension(
@@ -894,30 +937,23 @@ pub fn div_extension(
                 },
             );
 
-            let a_raw = {
-                let a_raws = RefCell::new(vec![]);
-                a.0.iter().for_each(|a_i| {
-                    a_i.value().map(|a_i_raw| {
-                        a_raws.borrow_mut().push((*a_i_raw).into());
-                    });
+            let output_raw = a[0]
+                .value()
+                .zip(a[1].value())
+                .zip(b[0].value())
+                .zip(b[1].value())
+                .map(|(((&a_0_raw, &a_1_raw), &b_0_raw), &b_1_raw)| {
+                    let a_raw = GoldilocksExtension([a_0_raw.into(), a_1_raw.into()]);
+                    let b_raw = GoldilocksExtension([b_0_raw.into(), b_1_raw.into()]);
+
+                    let output_raw = a_raw / b_raw;
+
+                    (*output_raw[0], *output_raw[1])
                 });
+            let output_raw = output_raw.unzip();
 
-                GoldilocksExtension(a_raws.into_inner().try_into().unwrap())
-            };
-            let b_raw = {
-                let b_raws = RefCell::new(vec![]);
-                b.0.iter().for_each(|b_i| {
-                    b_i.value().map(|b_i_raw| {
-                        b_raws.borrow_mut().push((*b_i_raw).into());
-                    });
-                });
-
-                GoldilocksExtension(b_raws.into_inner().try_into().unwrap())
-            };
-
-            let output_raw = a_raw / b_raw;
-            let output0 = gate.load_witness(&mut ctx, Value::known(output_raw[0].0));
-            let output1 = gate.load_witness(&mut ctx, Value::known(output_raw[1].0));
+            let output0 = gate.load_witness(&mut ctx, output_raw.0);
+            let output1 = gate.load_witness(&mut ctx, output_raw.1);
             let output0_assigned = AssignedCell::new(output0.value, output0.cell);
             let output1_assigned = AssignedCell::new(output1.value, output1.cell);
             let output_assigned = AssignedGoldilocksExtension([output0_assigned, output1_assigned]);
@@ -958,7 +994,7 @@ pub fn square_extension(
 }
 
 /// Constrain `output = a * scalar`.
-pub fn constant_scalar_extension(
+pub fn constant_scalar_mul_extension(
     mut layouter: impl Layouter<Fr>,
     range: &RangeConfig<Fr>,
     scalar: Fr,
@@ -1061,7 +1097,7 @@ pub fn constant_scalar_extension(
     Ok(AssignedGoldilocksExtension([output0, output1]))
 }
 
-pub fn scalar_extension(
+pub fn scalar_mul_extension(
     mut layouter: impl Layouter<Fr>,
     range: &RangeConfig<Fr>,
     advice_column: Column<Advice>,
@@ -1091,8 +1127,8 @@ pub fn arithmetic_extension(
         multiplicand1,
     )?;
     let tmp0 =
-        constant_scalar_extension(layouter.namespace(|| "first term"), range, constant0, tmp0)?;
-    let tmp1 = constant_scalar_extension(
+        constant_scalar_mul_extension(layouter.namespace(|| "first term"), range, constant0, tmp0)?;
+    let tmp1 = constant_scalar_mul_extension(
         layouter.namespace(|| "second term"),
         range,
         constant1,
@@ -1243,12 +1279,55 @@ pub fn exp_u64_extension(
     Ok(product)
 }
 
+pub fn simple_constraints(
+    mut layouter: impl Layouter<Fr>,
+    gate: &FlexGateConfig<Fr>,
+    // advice_column: Column<Advice>,
+    a: AssignedGoldilocksExtension,
+) -> Result<AssignedGoldilocksExtension, Error> {
+    // let gate = range.gate();
+    let output = RefCell::new(None);
+
+    layouter.assign_region(
+        || "divide a into b",
+        |region| {
+            let mut ctx = Context::new(
+                region,
+                ContextParams {
+                    max_rows: 1 << K,
+                    num_context_ids: 1,
+                    fixed_columns: gate.constants.clone(),
+                },
+            );
+
+            let output_raw = a.0[0]
+                .value()
+                .zip(a.0[1].value())
+                .map(|(&a_0_raw, &a_1_raw)| (a_0_raw, a_1_raw));
+            let output_raw = output_raw.unzip();
+
+            let output0 = gate.load_witness(&mut ctx, output_raw.0);
+            let output1 = gate.load_witness(&mut ctx, output_raw.1);
+            let output0_assigned = AssignedCell::new(output0.value, output0.cell);
+            let output1_assigned = AssignedCell::new(output1.value, output1.cell);
+            let output_assigned = AssignedGoldilocksExtension([output0_assigned, output1_assigned]);
+            *output.borrow_mut() = Some(output_assigned);
+
+            Ok(())
+        },
+    )?;
+
+    Ok(output.into_inner().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use halo2_base::{
         gates::range::RangeStrategy,
         halo2_proofs::{circuit::SimpleFloorPlanner, dev::MockProver, plonk::Circuit},
     };
+
+    use crate::utils::{evm_verify, gen_evm_verifier, gen_pk, gen_proof, gen_srs};
 
     use super::*;
 
@@ -1275,9 +1354,12 @@ mod tests {
             let a = meta.advice_column();
             meta.enable_equality(a);
 
-            // let gate = FlexGateConfig::configure(meta, GateStrategy::Vertical, &[1], 1, 0, K);
             let range =
-                RangeConfig::configure(meta, RangeStrategy::Vertical, &[5], &[6], 1, 15, 0, K);
+                RangeConfig::configure(meta, RangeStrategy::Vertical, &[1], &[0], 1, 15, 0, K); // 10k bytes
+                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[2], &[1], 1, 15, 0, K); // 15k bytes
+                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[1], &[6], 1, 15, 0, K); // invalid circuit
+                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[5], &[6], 1, 15, 0, K); // exceed code size
+
 
             Self::Config { a, range }
         }
@@ -1336,4 +1418,71 @@ mod tests {
             .unwrap()
             .assert_satisfied();
     }
+
+    #[test]
+    fn test_simple_circuit() {
+        let params = gen_srs(K as u32);
+
+        let circuit = MyCircuit;
+        MockProver::run(K as u32, &circuit, vec![])
+            .unwrap()
+            .assert_satisfied();
+        let pk = gen_pk(&params, &circuit);
+        let deployment_code = gen_evm_verifier(&params, pk.get_vk(), vec![0]);
+        let circuit_instances: Vec<Vec<Fr>> = vec![]; // circuit.instances()
+        let proof = gen_proof(K, &params, &pk, circuit, circuit_instances.clone());
+        evm_verify(deployment_code, circuit_instances, proof);
+    }
+
+    // #[derive(Clone)]
+    // pub struct SimpleConfig {
+    //     a: Column<Advice>,
+    //     range: RangeConfig<Fr>,
+    // }
+
+    // #[derive(Default)]
+    // pub struct SimpleCircuit;
+
+    // impl Circuit<Fr> for SimpleCircuit {
+    //     type Config = SimpleConfig;
+    //     type FloorPlanner = SimpleFloorPlanner;
+
+    //     fn without_witnesses(&self) -> Self {
+    //         Self::default()
+    //     }
+
+    //     fn configure(
+    //         meta: &mut halo2_base::halo2_proofs::plonk::ConstraintSystem<Fr>,
+    //     ) -> Self::Config {
+    //         let a = meta.advice_column();
+    //         meta.enable_equality(a);
+
+    //         let range =
+    //             RangeConfig::configure(meta, RangeStrategy::Vertical, &[5], &[6], 1, 15, 0, K);
+
+    //         Self::Config { a, range }
+    //     }
+
+    //     fn synthesize(
+    //         &self,
+    //         config: Self::Config,
+    //         mut layouter: impl Layouter<Fr>,
+    //     ) -> Result<(), Error> {
+    //         let a = config.a;
+    //         let gate = config.range.gate();
+
+    //         let value00 = Fr::from(1);
+    //         let value01 = Fr::from(2);
+
+    //         let value0 = AssignedGoldilocksExtension::assign(
+    //             layouter.namespace(|| "assign value0"),
+    //             a,
+    //             [value00.into(), value01.into()].into(),
+    //         )?;
+
+    //         simple_constraints(layouter, gate, value0)?;
+
+    //         Ok(())
+    //     }
+    // }
 }

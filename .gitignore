@@ -1,2 +1,4 @@
 /target
 /Cargo.lock
+/verifier.sol
+/verifier.yul
