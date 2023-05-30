@@ -1365,7 +1365,7 @@ impl GoldilocksExtensionChip<Fr> {
     pub fn constant_scalar_mul(
         &self,
         mut layouter: impl Layouter<Fr>,
-        scalar: Fr,
+        scalar: GoldilocksField,
         value: AssignedGoldilocksExtension,
     ) -> Result<AssignedGoldilocksExtension, Error> {
         let gate = self.range.gate();
@@ -1423,7 +1423,7 @@ impl GoldilocksExtensionChip<Fr> {
                     },
                 );
 
-                let scalar_assigned = gate.load_witness(&mut ctx, Value::known(scalar));
+                let scalar_assigned = gate.load_witness(&mut ctx, Value::known(scalar.0));
                 let a = value_assigned.borrow().clone().unwrap().clone();
 
                 // output0 = a0 * scalar
@@ -1482,8 +1482,8 @@ impl GoldilocksExtensionChip<Fr> {
     pub fn arithmetic(
         &self,
         mut layouter: impl Layouter<Fr>,
-        constant0: Fr,
-        constant1: Fr,
+        constant0: GoldilocksField,
+        constant1: GoldilocksField,
         multiplicand0: AssignedGoldilocksExtension,
         multiplicand1: AssignedGoldilocksExtension,
         addend: AssignedGoldilocksExtension,
@@ -1764,8 +1764,8 @@ mod tests {
             // [181, 38] = 3 * [1, 2] * [3, 4] + 4 * [1, 2] = 3 * [59, 10] + [4, 8] = [177, 30] + [4, 8]
             let output_assigned = ge_chip.arithmetic(
                 layouter.namespace(|| "arithmetic"),
-                value10,
-                value11,
+                value10.into(),
+                value11.into(),
                 value0.clone(),
                 value1,
                 value0,

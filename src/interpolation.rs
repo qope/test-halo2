@@ -6,7 +6,7 @@ use halo2_base::{
         range::RangeConfig,
     },
     halo2_proofs::{
-        circuit::{Layouter, SimpleFloorPlanner, AssignedCell},
+        circuit::{AssignedCell, Layouter, SimpleFloorPlanner},
         halo2curves::{bn256::Fr, FieldExt},
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     },
@@ -15,7 +15,8 @@ use plonky2::{
     field::{
         extension::{quadratic::QuadraticExtension, Extendable},
         goldilocks_field::GoldilocksField as GoldilocksFieldOriginal,
-        types::{Field, PrimeField}, interpolation::barycentric_weights,
+        interpolation::barycentric_weights,
+        types::{Field, PrimeField},
     },
     fri::FriParams,
     hash::hash_types::RichField,
@@ -32,9 +33,11 @@ use crate::{
     reducing::{AssignedReducingFactor, ReducingFactor},
 };
 
+pub const MAX_QUOTIENT_DEGREE_FACTOR: usize = 8;
+
 /// Computes P'(x^arity) from {P(x*g^i)}_(i=0..arity), where g is a `arity`-th root of unity
 /// and P' is the FRI reduced polynomial.
-fn compute_evaluation(
+pub fn compute_evaluation(
     mut layouter: impl Layouter<Fr>,
     range: &RangeConfig<Fr>,
     advice_column: Column<Advice>,
@@ -58,21 +61,23 @@ fn compute_evaluation(
     reverse_index_bits_in_place(&mut evals);
     // Want `g^(arity - rev_x_index_within_coset)` as in the out-of-circuit version. Compute it
     // as `(g^-1)^rev_x_index_within_coset`.
-    let start = exp_from_bits_const_base_assigned(g_inv, x_index_within_coset_bits.iter().rev());
-    let coset_start = gf_chip.mul(layouter.namespace(|| "mul"), start, x)?;
+    let start = exp_from_bits_const_base_assigned(
+        layouter.namespace(|| "exp"),
+        advice_column,
+        &gf_chip,
+        g_inv,
+        x_index_within_coset_bits.iter().rev(),
+    ).unwrap();
+    let coset_start = gf_chip.mul(layouter.namespace(|| "mul"), start, x).unwrap();
 
     // The answer is gotten by interpolating {(x*g^i, P(x*g^i))} and evaluating at beta.
-    let interpolation_gate = <CosetInterpolationGate<F, D>>::with_max_degree(
-        arity_bits,
-        self.config.max_quotient_degree_factor,
-    );
+    // let interpolation_gate = <CosetInterpolationGate<F, D>>::with_max_degree(
+    //     arity_bits,
+    //     self.config.max_quotient_degree_factor,
+    // );
 
-    let mut coset_interpolation_chip = CosetInterpolationChip::construct(
-        ge_chip,
-        arity_bits,
-        interpolation_gate.degree(),
-        interpolation_gate.barycentric_weights(),
-    );
+    let coset_interpolation_chip =
+        CosetInterpolationChip::with_max_degree(ge_chip, arity_bits, MAX_QUOTIENT_DEGREE_FACTOR);
     coset_interpolation_chip.interpolate_coset(
         layouter.namespace(|| "interpolate coset assigned"),
         advice_column,
@@ -85,14 +90,20 @@ fn compute_evaluation(
 pub fn exp_from_bits_const_base_assigned(
     mut layouter: impl Layouter<Fr>,
     advice_column: Column<Advice>,
-    ge_chip: GoldilocksFieldChip<Fr>,
+    ge_chip: &GoldilocksFieldChip<Fr>,
     base: GoldilocksFieldOriginal,
-    exponent_bits: impl IntoIterator<Item = impl Borrow<AssignedCell<Fr, Fr>>>,
+    exponent_bits: impl IntoIterator<Item = impl Borrow<AssignedCell<Fr, Fr>>>, // &[bool]
 ) -> Result<AssignedGoldilocksField, Error> {
-    let base_assigned = AssignedGoldilocksField::constant(layouter, advice_column, base.into())?;
-    let exponent_bits: Vec<_> = exponent_bits.into_iter().map(|b| *b.borrow()).collect();
+    let exponent_bits: Vec<_> = exponent_bits
+        .into_iter()
+        .map(|b| b.borrow().clone())
+        .collect();
 
-    let mut product = AssignedGoldilocksField::constant(layouter, advice_column, Fr::one().into())?;
+    let mut product = AssignedGoldilocksField::constant(
+        layouter.namespace(|| "assign one"),
+        advice_column,
+        Fr::one().into(),
+    ).unwrap();
     for (i, bit) in exponent_bits.iter().enumerate() {
         let pow = 1 << i;
         // If the bit is on, we multiply product by base^pow.
@@ -100,27 +111,28 @@ pub fn exp_from_bits_const_base_assigned(
         //     product *= 1 + bit (base^pow - 1)
         //     product = (base^pow - 1) product bit + product
         product = ge_chip.arithmetic(
-            layouter, advice_column,
+            layouter.namespace(|| "arithmetic"),
+            advice_column,
             (base.exp_u64(pow as u64) - GoldilocksFieldOriginal::ONE).into(),
             GoldilocksFieldOriginal::ONE.into(),
+            product.clone(),
+            bit.clone().into(),
             product,
-            bit.target,
-            product,
-        )?;
+        ).unwrap();
     }
 
     Ok(product)
 }
 
 #[derive(Clone, Debug)]
-pub struct CosetInterpolationChip<F: FieldExt> {
+pub struct CosetInterpolationChip {
     pub ge_chip: GoldilocksExtensionChip<Fr>,
     pub subgroup_bits: usize,
     pub degree: usize,
-    pub barycentric_weights: Vec<F>,
+    pub barycentric_weights: Vec<GoldilocksField>,
 }
 
-impl CosetInterpolationChip<Fr> {
+impl CosetInterpolationChip {
     pub fn new(ge_chip: GoldilocksExtensionChip<Fr>, subgroup_bits: usize) -> Self {
         Self::with_max_degree(ge_chip, subgroup_bits, 1 << subgroup_bits)
     }
@@ -146,7 +158,10 @@ impl CosetInterpolationChip<Fr> {
                 .into_iter()
                 .map(|x| (x, GoldilocksFieldOriginal::ZERO))
                 .collect::<Vec<_>>(),
-        );
+        )
+        .into_iter()
+        .map(|v| v.into())
+        .collect::<Vec<GoldilocksField>>();
 
         Self {
             ge_chip,
@@ -160,7 +175,7 @@ impl CosetInterpolationChip<Fr> {
         ge_chip: GoldilocksExtensionChip<Fr>,
         subgroup_bits: usize,
         degree: usize,
-        barycentric_weights: Vec<Fr>,
+        barycentric_weights: Vec<GoldilocksField>,
     ) -> Self {
         Self {
             ge_chip,
@@ -198,13 +213,13 @@ impl CosetInterpolationChip<Fr> {
         let subgroup_bits = self.subgroup_bits;
         let barycentric_weights = &self.barycentric_weights;
         // evaluation_point == shifted_evaluation_point * shift
-        let inv_shift = gf_chip.inv(layouter.namespace(|| ""), advice_column, shift)?;
+        let inv_shift = gf_chip.inv(layouter.namespace(|| ""), advice_column, shift).unwrap();
         let shifted_evaluation_point = self.ge_chip.scalar_mul(
             layouter.namespace(|| "scalar mul"),
             advice_column,
-            *inv_shift,
-            evaluation_point.clone(),
-        )?;
+            inv_shift.0,
+            evaluation_point,
+        ).unwrap();
 
         let domain = GoldilocksFieldOriginal::two_adic_subgroup(subgroup_bits);
         let weights = barycentric_weights;
@@ -213,12 +228,12 @@ impl CosetInterpolationChip<Fr> {
             layouter.namespace(|| "assign zero"),
             advice_column,
             GoldilocksExtension::zero(),
-        )?;
+        ).unwrap();
         let initial_partial_prod = AssignedGoldilocksExtension::constant(
             layouter.namespace(|| "assign one"),
             advice_column,
             GoldilocksExtension::one(),
-        )?;
+        ).unwrap();
         let (mut computed_eval, mut computed_prod) = partial_interpolate(
             layouter.namespace(|| "partial interpolate"),
             &self.ge_chip,
@@ -229,7 +244,7 @@ impl CosetInterpolationChip<Fr> {
             shifted_evaluation_point.clone(),
             initial_eval,
             initial_partial_prod,
-        )?;
+        ).unwrap();
 
         for i in 0..self.num_intermediates() {
             let start_index = 1 + (degree - 1) * (i + 1);
@@ -244,7 +259,7 @@ impl CosetInterpolationChip<Fr> {
                 shifted_evaluation_point.clone(),
                 computed_eval,
                 computed_prod,
-            )?;
+            ).unwrap();
         }
 
         Ok(computed_eval)
@@ -264,7 +279,7 @@ fn partial_interpolate(
     advice_column: Column<Advice>,
     domain: &[GoldilocksFieldOriginal],
     values: &[AssignedGoldilocksExtension],
-    barycentric_weights: &[Fr],
+    barycentric_weights: &[GoldilocksField],
     x: AssignedGoldilocksExtension,
     initial_eval: AssignedGoldilocksExtension,
     initial_partial_prod: AssignedGoldilocksExtension,
@@ -280,7 +295,7 @@ fn partial_interpolate(
         .map(|(value, &weight)| {
             ge_chip.constant_scalar_mul(layouter.namespace(|| "scalar mul"), weight, value.clone())
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>().unwrap();
 
     weighted_values.iter().zip(domain.iter()).fold(
         Ok((initial_eval, initial_partial_prod)),
@@ -446,4 +461,155 @@ pub fn interpolate<F: Field>(points: &[(F, F)], x: F, barycentric_weights: &[F])
         .sum();
 
     l_x * sum
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use halo2_base::{gates::range::RangeStrategy, halo2_proofs};
+    use halo2_proofs::{
+        circuit::{Layouter, SimpleFloorPlanner},
+        dev::MockProver,
+        halo2curves::bn256::Fr,
+        plonk::{Advice, Circuit, Column, Error},
+    };
+    use plonky2::{fri::verifier::ComputeEvaluationData, plonk::circuit_data::CircuitConfig};
+
+    use crate::utils::{evm_verify, gen_evm_verifier, gen_pk, gen_proof, gen_srs};
+
+    use super::*;
+
+    const K: usize = 18;
+
+    fn to_bits_le(mut value: usize) -> Vec<bool> {
+        let mut result = vec![];
+        while value != 0 {
+            result.push(value & 1 == 1);
+            value >>= 1;
+        }
+
+        result
+    }
+
+    #[test]
+    fn test_to_bits_le() {
+        assert_eq!(to_bits_le(6), [false, true, true]);
+    }
+
+    #[derive(Clone)]
+    pub struct MyConfig {
+        a: Column<Advice>,
+        range: RangeConfig<Fr>,
+    }
+
+    #[derive(Clone, Default)]
+    pub struct MyCircuit;
+
+    impl Circuit<Fr> for MyCircuit {
+        type Config = MyConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self::default()
+        }
+
+        fn configure(
+            meta: &mut halo2_base::halo2_proofs::plonk::ConstraintSystem<Fr>,
+        ) -> Self::Config {
+            let a = meta.advice_column();
+            meta.enable_equality(a);
+
+            let range =
+                RangeConfig::configure(meta, RangeStrategy::Vertical, &[1], &[0], 1, 15, 0, K);
+
+            Self::Config { a, range }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fr>,
+        ) -> Result<(), Error> {
+            let range = &config.range;
+            let advice_column = config.a;
+
+            let mut file = std::fs::File::open("fri_compute_evaluation_0.json").unwrap();
+            let mut raw_contents = String::new();
+            file.read_to_string(&mut raw_contents).unwrap();
+            let evaluation_data: ComputeEvaluationData<GoldilocksFieldOriginal, 2> =
+                serde_json::from_str(&raw_contents).unwrap();
+            let x_assigned = AssignedGoldilocksField::assign(
+                layouter.namespace(|| "assign x"),
+                advice_column,
+                evaluation_data.x.into(),
+            ).unwrap();
+            let x_index_within_coset_bits = to_bits_le(evaluation_data.x_index_within_coset);
+            let x_index_within_coset_assigned = x_index_within_coset_bits
+                .into_iter()
+                .map(|bit| {
+                    Ok(AssignedGoldilocksField::assign(
+                        layouter.namespace(|| "assign x_index_within_coset"),
+                        advice_column,
+                        GoldilocksFieldOriginal::from_canonical_u64(bit as u64).into(),
+                    )?.0)
+                })
+                .collect::<Result<Vec<_>, Error>>().unwrap();
+            let evals_assigned = evaluation_data
+                .evals
+                .into_iter()
+                .map(|eval| {
+                    AssignedGoldilocksExtension::assign(
+                        layouter.namespace(|| "assign evals"),
+                        advice_column,
+                        eval.0.map(GoldilocksField::from).into(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>().unwrap();
+            let beta_assigned = AssignedGoldilocksExtension::assign(
+                layouter.namespace(|| "assign beta"),
+                advice_column,
+                evaluation_data.beta.0.map(GoldilocksField::from).into(),
+            ).unwrap();
+            let next_eval: GoldilocksExtension = evaluation_data.next_eval.0.map(GoldilocksField::from).into();
+
+            let output_assigned = compute_evaluation(
+                layouter.namespace(|| "compute evaluation"),
+                range,
+                advice_column,
+                x_assigned,
+                &x_index_within_coset_assigned,
+                evaluation_data.arity_bits,
+                &evals_assigned,
+                beta_assigned,
+            )
+            .unwrap();
+
+            // assertion error:
+            // 0x000000000000000000000000000000000000000000000000f045f89ce839fa5d
+            // 0x0000000000000000000000000000000000000000000000008019383a50d011ef
+            output_assigned[0]
+                .value()
+                .assert_if_known(|&&x| dbg!(x) == dbg!(*next_eval[0]));
+            output_assigned[1]
+                .value()
+                .assert_if_known(|&&x| dbg!(x) == dbg!(*next_eval[1]));
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_fri_compute_evaluation_circuit() {
+        let circuit = MyCircuit;
+        MockProver::run(K as u32, &circuit, vec![])
+            .unwrap()
+            .assert_satisfied();
+        // let params = gen_srs(K as u32);
+        // let pk = gen_pk(&params, &circuit);
+        // let deployment_code = gen_evm_verifier(&params, pk.get_vk(), vec![0]);
+        // let circuit_instances: Vec<Vec<Fr>> = vec![]; // circuit.instances()
+        // let proof = gen_proof(K, &params, &pk, circuit, circuit_instances.clone());
+        // evm_verify(deployment_code, circuit_instances, proof);
+    }
 }
