@@ -1,7 +1,6 @@
 use std::borrow::Borrow;
 
 use halo2_base::{
-    gates::range::RangeConfig,
     halo2_proofs::{
         circuit::Layouter,
         halo2curves::bn256::Fr,

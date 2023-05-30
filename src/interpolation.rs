@@ -1,43 +1,31 @@
 use std::borrow::Borrow;
 
 use halo2_base::{
-    gates::{
-        flex_gate::{FlexGateConfig, GateStrategy},
-        range::RangeConfig,
-    },
+    gates::range::RangeConfig,
     halo2_proofs::{
-        circuit::{AssignedCell, Layouter, SimpleFloorPlanner},
-        halo2curves::{bn256::Fr, FieldExt},
-        plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
+        circuit::{AssignedCell, Layouter},
+        halo2curves::bn256::Fr,
+        plonk::{Advice, Column, Error},
     },
 };
 use plonky2::{
     field::{
-        extension::{quadratic::QuadraticExtension, Extendable},
         goldilocks_field::GoldilocksField as GoldilocksFieldOriginal,
-        interpolation::barycentric_weights,
-        types::{Field, PrimeField},
+        interpolation::barycentric_weights, types::Field,
     },
-    fri::FriParams,
-    hash::hash_types::RichField,
-    util::{bits_u64, reverse_index_bits_in_place},
+    util::reverse_index_bits_in_place,
 };
-use poseidon_circuit::poseidon::{primitives::P128Pow5T3, Pow5Chip, Pow5Config};
-use serde::{Deserialize, Serialize};
 
-use crate::{
-    field::{
-        from_base_field, zero_assigned, AssignedGoldilocksExtension, AssignedGoldilocksField,
-        GoldilocksExtension, GoldilocksExtensionChip, GoldilocksField, GoldilocksFieldChip,
-    },
-    reducing::{AssignedReducingFactor, ReducingFactor},
+use crate::field::{
+    from_base_field, AssignedGoldilocksExtension, AssignedGoldilocksField, GoldilocksExtension,
+    GoldilocksExtensionChip, GoldilocksField, GoldilocksFieldChip,
 };
 
 pub const MAX_QUOTIENT_DEGREE_FACTOR: usize = 8;
 
 /// Computes P'(x^arity) from {P(x*g^i)}_(i=0..arity), where g is a `arity`-th root of unity
 /// and P' is the FRI reduced polynomial.
-pub fn compute_evaluation(
+pub fn compute_evaluation_assigned(
     mut layouter: impl Layouter<Fr>,
     range: &RangeConfig<Fr>,
     advice_column: Column<Advice>,
@@ -67,7 +55,8 @@ pub fn compute_evaluation(
         &gf_chip,
         g_inv,
         x_index_within_coset_bits.iter().rev(),
-    ).unwrap();
+    )
+    .unwrap();
     let coset_start = gf_chip.mul(layouter.namespace(|| "mul"), start, x).unwrap();
 
     // The answer is gotten by interpolating {(x*g^i, P(x*g^i))} and evaluating at beta.
@@ -90,7 +79,7 @@ pub fn compute_evaluation(
 pub fn exp_from_bits_const_base_assigned(
     mut layouter: impl Layouter<Fr>,
     advice_column: Column<Advice>,
-    ge_chip: &GoldilocksFieldChip<Fr>,
+    gf_chip: &GoldilocksFieldChip<Fr>,
     base: GoldilocksFieldOriginal,
     exponent_bits: impl IntoIterator<Item = impl Borrow<AssignedCell<Fr, Fr>>>, // &[bool]
 ) -> Result<AssignedGoldilocksField, Error> {
@@ -103,22 +92,25 @@ pub fn exp_from_bits_const_base_assigned(
         layouter.namespace(|| "assign one"),
         advice_column,
         Fr::one().into(),
-    ).unwrap();
+    )
+    .unwrap();
     for (i, bit) in exponent_bits.iter().enumerate() {
         let pow = 1 << i;
         // If the bit is on, we multiply product by base^pow.
         // We can arithmetize this as:
         //     product *= 1 + bit (base^pow - 1)
         //     product = (base^pow - 1) product bit + product
-        product = ge_chip.arithmetic(
-            layouter.namespace(|| "arithmetic"),
-            advice_column,
-            (base.exp_u64(pow as u64) - GoldilocksFieldOriginal::ONE).into(),
-            GoldilocksFieldOriginal::ONE.into(),
-            product.clone(),
-            bit.clone().into(),
-            product,
-        ).unwrap();
+        product = gf_chip
+            .arithmetic(
+                layouter.namespace(|| "arithmetic"),
+                advice_column,
+                (base.exp_u64(pow as u64) - GoldilocksFieldOriginal::ONE).into(),
+                GoldilocksFieldOriginal::ONE.into(),
+                product.clone(),
+                bit.clone().into(),
+                product,
+            )
+            .unwrap();
     }
 
     Ok(product)
@@ -185,18 +177,22 @@ impl CosetInterpolationChip {
         }
     }
 
-    fn degree(&self) -> usize {
-        self.degree
-    }
+    // fn degree(&self) -> usize {
+    //     self.degree
+    // }
 
-    fn num_points(&self) -> usize {
-        1 << self.subgroup_bits
-    }
+    // fn num_points(&self) -> usize {
+    //     1 << self.subgroup_bits
+    // }
 
-    fn num_intermediates(&self) -> usize {
-        (self.num_points() - 2) / (self.degree() - 1)
-    }
+    // fn num_intermediates(&self) -> usize {
+    //     (self.num_points() - 2) / (self.degree() - 1)
+    // }
 
+    /// Compute the following value:
+    /// Let `points` be the set \{ (shift \cdot g^i, values[i]) \}_{i = 0}^{values.len() - 1}$,
+    /// then `output = P(evaluation_point)` where `P` is the unique degree < `values.len()` polynomial
+    /// that for all $(a, b)$ in `points`, `P(a) = b`.
     fn interpolate_coset(
         &self,
         mut layouter: impl Layouter<Fr>,
@@ -208,59 +204,66 @@ impl CosetInterpolationChip {
     ) -> Result<AssignedGoldilocksExtension, Error> {
         let gf_chip = GoldilocksFieldChip::construct(self.ge_chip.range.clone());
 
-        let degree = self.degree();
-        let num_points = self.num_points();
+        // let degree = self.degree();
+        // let num_points = self.num_points();
         let subgroup_bits = self.subgroup_bits;
         let barycentric_weights = &self.barycentric_weights;
         // evaluation_point == shifted_evaluation_point * shift
-        let inv_shift = gf_chip.inv(layouter.namespace(|| ""), advice_column, shift).unwrap();
-        let shifted_evaluation_point = self.ge_chip.scalar_mul(
-            layouter.namespace(|| "scalar mul"),
-            advice_column,
-            inv_shift.0,
-            evaluation_point,
-        ).unwrap();
+        let inv_shift = gf_chip
+            .inv(layouter.namespace(|| "inv"), advice_column, shift)
+            .unwrap();
+        let shifted_evaluation_point = self
+            .ge_chip
+            .scalar_mul(
+                layouter.namespace(|| "scalar mul"),
+                advice_column,
+                inv_shift.0,
+                evaluation_point,
+            )
+            .unwrap();
 
         let domain = GoldilocksFieldOriginal::two_adic_subgroup(subgroup_bits);
-        let weights = barycentric_weights;
 
         let initial_eval = AssignedGoldilocksExtension::constant(
             layouter.namespace(|| "assign zero"),
             advice_column,
             GoldilocksExtension::zero(),
-        ).unwrap();
+        )
+        .unwrap();
         let initial_partial_prod = AssignedGoldilocksExtension::constant(
             layouter.namespace(|| "assign one"),
             advice_column,
             GoldilocksExtension::one(),
-        ).unwrap();
-        let (mut computed_eval, mut computed_prod) = partial_interpolate(
+        )
+        .unwrap();
+        let (computed_eval, _) = partial_interpolate(
             layouter.namespace(|| "partial interpolate"),
             &self.ge_chip,
             advice_column,
-            &domain[..degree],
-            &values[..degree],
-            &weights[..degree],
-            shifted_evaluation_point.clone(),
+            &domain,
+            values,
+            barycentric_weights,
+            shifted_evaluation_point,
             initial_eval,
             initial_partial_prod,
-        ).unwrap();
+        )
+        .unwrap();
 
-        for i in 0..self.num_intermediates() {
-            let start_index = 1 + (degree - 1) * (i + 1);
-            let end_index = (start_index + degree - 1).min(num_points);
-            (computed_eval, computed_prod) = partial_interpolate(
-                layouter.namespace(|| "partial interpolate"),
-                &self.ge_chip,
-                advice_column,
-                &domain[start_index..end_index],
-                &values[start_index..end_index],
-                &weights[start_index..end_index],
-                shifted_evaluation_point.clone(),
-                computed_eval,
-                computed_prod,
-            ).unwrap();
-        }
+        // for i in 0..self.num_intermediates() {
+        //     let start_index = 1 + (degree - 1) * (i + 1);
+        //     let end_index = (start_index + degree - 1).min(num_points);
+        //     (computed_eval, computed_prod) = partial_interpolate(
+        //         layouter.namespace(|| "partial interpolate"),
+        //         &self.ge_chip,
+        //         advice_column,
+        //         &domain[start_index..end_index],
+        //         &values[start_index..end_index],
+        //         &barycentric_weights[start_index..end_index],
+        //         shifted_evaluation_point.clone(),
+        //         computed_eval,
+        //         computed_prod,
+        //     ).unwrap();
+        // }
 
         Ok(computed_eval)
     }
@@ -295,7 +298,8 @@ fn partial_interpolate(
         .map(|(value, &weight)| {
             ge_chip.constant_scalar_mul(layouter.namespace(|| "scalar mul"), weight, value.clone())
         })
-        .collect::<Result<Vec<_>, _>>().unwrap();
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
 
     weighted_values.iter().zip(domain.iter()).fold(
         Ok((initial_eval, initial_partial_prod)),
@@ -474,9 +478,7 @@ mod tests {
         halo2curves::bn256::Fr,
         plonk::{Advice, Circuit, Column, Error},
     };
-    use plonky2::{fri::verifier::ComputeEvaluationData, plonk::circuit_data::CircuitConfig};
-
-    use crate::utils::{evm_verify, gen_evm_verifier, gen_pk, gen_proof, gen_srs};
+    use plonky2::fri::verifier::ComputeEvaluationData;
 
     use super::*;
 
@@ -543,7 +545,8 @@ mod tests {
                 layouter.namespace(|| "assign x"),
                 advice_column,
                 evaluation_data.x.into(),
-            ).unwrap();
+            )
+            .unwrap();
             let x_index_within_coset_bits = to_bits_le(evaluation_data.x_index_within_coset);
             let x_index_within_coset_assigned = x_index_within_coset_bits
                 .into_iter()
@@ -552,9 +555,11 @@ mod tests {
                         layouter.namespace(|| "assign x_index_within_coset"),
                         advice_column,
                         GoldilocksFieldOriginal::from_canonical_u64(bit as u64).into(),
-                    )?.0)
+                    )?
+                    .0)
                 })
-                .collect::<Result<Vec<_>, Error>>().unwrap();
+                .collect::<Result<Vec<_>, Error>>()
+                .unwrap();
             let evals_assigned = evaluation_data
                 .evals
                 .into_iter()
@@ -565,15 +570,21 @@ mod tests {
                         eval.0.map(GoldilocksField::from).into(),
                     )
                 })
-                .collect::<Result<Vec<_>, _>>().unwrap();
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
             let beta_assigned = AssignedGoldilocksExtension::assign(
                 layouter.namespace(|| "assign beta"),
                 advice_column,
                 evaluation_data.beta.0.map(GoldilocksField::from).into(),
-            ).unwrap();
-            let next_eval: GoldilocksExtension = evaluation_data.next_eval.0.map(GoldilocksField::from).into();
+            )
+            .unwrap();
+            let next_eval: GoldilocksExtension = evaluation_data
+                .next_eval
+                .0
+                .map(GoldilocksField::from)
+                .into();
 
-            let output_assigned = compute_evaluation(
+            let output_assigned = compute_evaluation_assigned(
                 layouter.namespace(|| "compute evaluation"),
                 range,
                 advice_column,
@@ -585,15 +596,12 @@ mod tests {
             )
             .unwrap();
 
-            // assertion error:
-            // 0x000000000000000000000000000000000000000000000000f045f89ce839fa5d
-            // 0x0000000000000000000000000000000000000000000000008019383a50d011ef
             output_assigned[0]
                 .value()
-                .assert_if_known(|&&x| dbg!(x) == dbg!(*next_eval[0]));
+                .assert_if_known(|&&x| x == *next_eval[0]);
             output_assigned[1]
                 .value()
-                .assert_if_known(|&&x| dbg!(x) == dbg!(*next_eval[1]));
+                .assert_if_known(|&&x| x == *next_eval[1]);
 
             Ok(())
         }
