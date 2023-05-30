@@ -5,13 +5,12 @@ use halo2_base::{
     halo2_proofs::{
         circuit::Layouter,
         halo2curves::bn256::Fr,
-        plonk::{Advice, Column},
+        plonk::{Advice, Column, Error},
     },
 };
 
 use crate::field::{
-    add_extension, exp_u64_extension, mul_extension, zero_assigned, AssignedGoldilocksExtension,
-    GoldilocksExtension,
+    zero_assigned, AssignedGoldilocksExtension, GoldilocksExtension, GoldilocksExtensionChip,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -48,26 +47,29 @@ impl ReducingFactor {
 
 #[derive(Clone, Debug)]
 pub struct AssignedReducingFactor {
+    pub ge_chip: GoldilocksExtensionChip<Fr>,
     base: AssignedGoldilocksExtension,
     count: u64,
 }
 
 impl AssignedReducingFactor {
-    pub fn new(base: AssignedGoldilocksExtension) -> Self {
-        Self { base, count: 0 }
+    pub fn new(ge_chip: GoldilocksExtensionChip<Fr>, base: AssignedGoldilocksExtension) -> Self {
+        Self {
+            ge_chip,
+            base,
+            count: 0,
+        }
     }
 
     /// Reduces a vector of `ExtensionTarget`s using `ReducingExtensionGate`s.
     pub fn reduce(
         &mut self,
         mut layouter: impl Layouter<Fr>,
-        range: &RangeConfig<Fr>,
         advice_column: Column<Advice>,
         terms: &[AssignedGoldilocksExtension], // Could probably work with a `DoubleEndedIterator` too.
-    ) -> AssignedGoldilocksExtension {
+    ) -> Result<AssignedGoldilocksExtension, Error> {
         self.reduce_arithmetic(
             layouter.namespace(|| "reduce arithmetic"),
-            range,
             advice_column,
             terms,
         )
@@ -76,41 +78,41 @@ impl AssignedReducingFactor {
     pub fn shift(
         &mut self,
         mut layouter: impl Layouter<Fr>,
-        range: &RangeConfig<Fr>,
         advice_column: Column<Advice>,
         x: AssignedGoldilocksExtension,
-    ) -> AssignedGoldilocksExtension {
-        let exp = exp_u64_extension(
-            layouter.namespace(|| "exp"),
-            range,
-            advice_column,
-            self.base.clone(),
-            self.count,
-        )
-        .unwrap();
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let exp = self.ge_chip
+            .exp_u64(
+                layouter.namespace(|| "exp"),
+                advice_column,
+                self.base.clone(),
+                self.count,
+            )?;
 
         self.count = 0;
-        mul_extension(layouter.namespace(|| "multiply exp by x"), range, exp, x).unwrap()
+
+        self.ge_chip
+            .mul(layouter.namespace(|| "multiply exp by x"), exp, x)
     }
 
     /// Reduces a vector of `ExtensionTarget`s using `ArithmeticGate`s.
     fn reduce_arithmetic(
         &mut self,
         mut layouter: impl Layouter<Fr>,
-        range: &RangeConfig<Fr>,
         advice_column: Column<Advice>,
         terms: &[AssignedGoldilocksExtension],
-    ) -> AssignedGoldilocksExtension {
-        let zero = zero_assigned(layouter.namespace(|| "zero"), advice_column).unwrap();
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let zero = zero_assigned(layouter.namespace(|| "zero"), advice_column)?;
         self.count += terms.len() as u64;
         terms.iter().rev().fold(
-            AssignedGoldilocksExtension([zero.clone(), zero]),
+            Ok(AssignedGoldilocksExtension([zero.clone(), zero])),
             |acc, et| {
                 // builder.mul_add_extension(self.base, acc, et)
-                let tmp =
-                    mul_extension(layouter.namespace(|| "mul"), range, self.base.clone(), acc)
-                        .unwrap();
-                add_extension(layouter.namespace(|| "add"), range, tmp, et.clone()).unwrap()
+                let tmp = self.ge_chip
+                    .mul(layouter.namespace(|| "mul"), self.base.clone(), acc?)?;
+
+                self.ge_chip
+                    .add(layouter.namespace(|| "add"), tmp, et.clone())
             },
         )
     }

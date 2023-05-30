@@ -7,7 +7,7 @@ use halo2_base::{
     gates::{flex_gate::FlexGateConfig, range::RangeConfig, GateInstructions, RangeInstructions},
     halo2_proofs::{
         circuit::{AssignedCell, Layouter, Value},
-        halo2curves::bn256::Fr,
+        halo2curves::{bn256::Fr, FieldExt},
         plonk::{Advice, Column, Error},
     },
     AssignedValue, Context, ContextParams, QuantumCell,
@@ -85,9 +85,9 @@ impl<'a, 'b> Mul<&'b GoldilocksField> for &'a GoldilocksField {
 
     #[inline]
     fn mul(self, rhs: &'b GoldilocksField) -> GoldilocksField {
-        let output0 = convert_fr_to_big_uint(self.0) * convert_fr_to_big_uint(rhs.0);
-        let output0_bi = output0 % BigUint::from(GOLDILOCKS_FIELD_ORDER);
-        let output_fr = convert_big_uint_to_fr(output0_bi);
+        let output = convert_fr_to_big_uint(self.0) * convert_fr_to_big_uint(rhs.0);
+        let output_bi = output % BigUint::from(GOLDILOCKS_FIELD_ORDER);
+        let output_fr = convert_big_uint_to_fr(output_bi);
 
         GoldilocksField(output_fr)
     }
@@ -138,9 +138,50 @@ fn test_inv() {
     assert_eq!(a * inv_a, one);
 }
 
+impl<'a, 'b> Div<&'b GoldilocksField> for &'a GoldilocksField {
+    type Output = GoldilocksField;
+
+    #[inline]
+    fn div(self, rhs: &'b GoldilocksField) -> GoldilocksField {
+        let inv_rhs = rhs.inv();
+        let output = convert_fr_to_big_uint(self.0) * convert_fr_to_big_uint(inv_rhs.0);
+        let output_bi = output % BigUint::from(GOLDILOCKS_FIELD_ORDER);
+        let output_fr = convert_big_uint_to_fr(output_bi);
+
+        GoldilocksField(output_fr)
+    }
+}
+
+impl<'b> Div<&'b GoldilocksField> for GoldilocksField {
+    type Output = GoldilocksField;
+
+    #[inline]
+    fn div(self, rhs: &'b GoldilocksField) -> GoldilocksField {
+        (&self).div(rhs)
+    }
+}
+
+impl Div<GoldilocksField> for GoldilocksField {
+    type Output = GoldilocksField;
+
+    #[inline]
+    fn div(self, rhs: GoldilocksField) -> GoldilocksField {
+        self.div(&rhs)
+    }
+}
+
 impl From<Fr> for GoldilocksField {
     fn from(value: Fr) -> Self {
         let value_bi = convert_fr_to_big_uint(value) % BigUint::from(GOLDILOCKS_FIELD_ORDER);
+        let value_fr = convert_big_uint_to_fr(value_bi);
+
+        Self(value_fr)
+    }
+}
+
+impl From<GoldilocksFieldOriginal> for GoldilocksField {
+    fn from(value: GoldilocksFieldOriginal) -> Self {
+        let value_bi = value.to_canonical_biguint();
         let value_fr = convert_big_uint_to_fr(value_bi);
 
         Self(value_fr)
@@ -179,12 +220,40 @@ impl AssignedGoldilocksField {
 }
 
 impl AssignedGoldilocksField {
-    /// Constrain `a == b`.
-    pub fn connect(
-        &self,
+    pub fn zero(
         mut layouter: impl Layouter<Fr>,
-        other: Self,
-    ) -> Result<(), Error> {
+        advice_column: Column<Advice>,
+    ) -> Result<Self, Error> {
+        let zero = GoldilocksField::from(Fr::zero());
+
+        Self::constant(layouter, advice_column, zero)
+    }
+
+    pub fn one(
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+    ) -> Result<Self, Error> {
+        let one = GoldilocksField::from(Fr::one());
+
+        Self::constant(layouter, advice_column, one)
+    }
+
+    pub fn constant(
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        val: GoldilocksField,
+    ) -> Result<Self, Error> {
+        let constant_cell = assign_val(
+            layouter.namespace(|| "assign constant"),
+            advice_column,
+            val.0,
+        )?;
+
+        Ok(Self(constant_cell))
+    }
+
+    /// Constrain `a == b`.
+    pub fn connect(&self, mut layouter: impl Layouter<Fr>, other: Self) -> Result<(), Error> {
         layouter.assign_region(
             || "constrain_equal self and other",
             |mut region| {
@@ -195,6 +264,282 @@ impl AssignedGoldilocksField {
         )?;
 
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GoldilocksFieldChip<F: FieldExt> {
+    pub range: RangeConfig<F>,
+}
+
+impl GoldilocksFieldChip<Fr> {
+    pub fn construct(range_config: RangeConfig<Fr>) -> Self {
+        Self {
+            range: range_config,
+        }
+    }
+
+    pub fn add(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        a: AssignedGoldilocksField,
+        b: AssignedGoldilocksField,
+    ) -> Result<AssignedGoldilocksField, Error> {
+        let gate = self.range.gate();
+        let a_assigned: RefCell<Option<AssignedValue<Fr>>> = RefCell::new(None);
+        let b_assigned: RefCell<Option<AssignedValue<Fr>>> = RefCell::new(None);
+        let output0_assigned = RefCell::new(None);
+
+        layouter.assign_region(
+            || "assign a and b",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a = gate.load_witness(&mut ctx, a.value().and_then(|v| Value::known(*v)));
+                *a_assigned.borrow_mut() = Some(a);
+
+                let b = gate.load_witness(&mut ctx, b.value().and_then(|v| Value::known(*v)));
+                *b_assigned.borrow_mut() = Some(b);
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "copy a and b",
+            |mut region| {
+                region
+                    .constrain_equal(a_assigned.clone().into_inner().unwrap().cell(), a.cell())?;
+                region
+                    .constrain_equal(b_assigned.clone().into_inner().unwrap().cell(), b.cell())?;
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "assign zero extension",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a = a_assigned.borrow().clone().unwrap().clone();
+                let b = b_assigned.borrow().clone().unwrap().clone();
+                let a0 = QuantumCell::Existing(&a);
+                let b0 = QuantumCell::Existing(&b);
+
+                // output0 = a0 + b0
+                let output0 = gate.add(&mut ctx, a0, b0);
+                let output0 = AssignedCell::new(output0.value, output0.cell);
+                *output0_assigned.borrow_mut() = Some(output0);
+
+                Ok(())
+            },
+        )?;
+
+        let output0 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output0 mod order"),
+            &self.range,
+            output0_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        Ok(AssignedGoldilocksField(output0))
+    }
+
+    /// Constrain `output = a * b`.
+    pub fn mul(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksField,
+        b: AssignedGoldilocksField,
+    ) -> Result<AssignedGoldilocksField, Error> {
+        let gate = self.range.gate();
+        let a_assigned: RefCell<Option<AssignedValue<Fr>>> = RefCell::new(None);
+        let b_assigned: RefCell<Option<AssignedValue<Fr>>> = RefCell::new(None);
+        let output0_assigned = RefCell::new(None);
+
+        layouter.assign_region(
+            || "assign a and b",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a0 = gate.load_witness(&mut ctx, a.value().and_then(|v| Value::known(*v)));
+                *a_assigned.borrow_mut() = Some(a0);
+
+                let b0 = gate.load_witness(&mut ctx, b.value().and_then(|v| Value::known(*v)));
+                *b_assigned.borrow_mut() = Some(b0);
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "copy a and b",
+            |mut region| {
+                region
+                    .constrain_equal(a_assigned.clone().into_inner().unwrap().cell(), a.cell())?;
+                region
+                    .constrain_equal(b_assigned.clone().into_inner().unwrap().cell(), b.cell())?;
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "assign zero extension",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a = a_assigned.borrow().clone().unwrap().clone();
+                let b = b_assigned.borrow().clone().unwrap().clone();
+                let a0 = QuantumCell::Existing(&a);
+                let b0 = QuantumCell::Existing(&b);
+
+                // output0 = a0 * b0 + W * a1 * b1
+                let w = Fr::from(7);
+                let w_assigned = gate.load_witness(&mut ctx, Value::known(w));
+                let output0 = gate.mul(&mut ctx, a0.clone(), b0.clone());
+                let output0 = AssignedCell::new(output0.value, output0.cell);
+                *output0_assigned.borrow_mut() = Some(output0);
+
+                Ok(())
+            },
+        )?;
+
+        let output0 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output0 mod order"),
+            &self.range,
+            output0_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        Ok(AssignedGoldilocksField(output0))
+    }
+
+    /// Constrain `output = a / b`.
+    fn div(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksField,
+        b: AssignedGoldilocksField,
+    ) -> Result<AssignedGoldilocksField, Error> {
+        let gate = self.range.gate();
+        let output = RefCell::new(None);
+
+        layouter.assign_region(
+            || "divide a into b",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let output_raw = a.value().zip(b.value()).map(|(&a_raw, &b_raw)| {
+                    let a_raw: GoldilocksField = a_raw.into();
+                    let b_raw: GoldilocksField = b_raw.into();
+                    let output_raw = a_raw / b_raw;
+
+                    *output_raw
+                });
+
+                let output0 = gate.load_witness(&mut ctx, output_raw);
+                let output_assigned =
+                    AssignedGoldilocksField(AssignedCell::new(output0.value, output0.cell));
+                *output.borrow_mut() = Some(output_assigned);
+
+                Ok(())
+            },
+        )?;
+
+        let output_assigned = output.into_inner().unwrap();
+        let expected_a_assigned =
+            self.mul(layouter.namespace(|| "mul"), output_assigned.clone(), b)?;
+
+        layouter.assign_region(
+            || "constrain equal",
+            |mut region| {
+                region.constrain_equal(expected_a_assigned.cell(), a.cell())?;
+
+                Ok(())
+            },
+        )?;
+
+        Ok(output_assigned)
+    }
+
+    /// Constrain `output = 1 / value`.
+    pub fn inv(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        value: AssignedGoldilocksField,
+    ) -> Result<AssignedGoldilocksField, Error> {
+        let one = AssignedGoldilocksField::one(layouter.namespace(|| "assign one"), advice_column)?;
+
+        self.div(layouter.namespace(|| "div"), one, value)
+    }
+
+    /// Constrain `output = a * scalar`.
+    pub fn constant_scalar_mul(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        scalar: GoldilocksField,
+        value: AssignedGoldilocksField,
+    ) -> Result<AssignedGoldilocksField, Error> {
+        let scalar_assigned = AssignedGoldilocksField::constant(layouter.namespace(|| "assign scalar"), advice_column, scalar)?;
+        
+        self.mul(layouter, scalar_assigned, value)
+    }
+
+    pub fn arithmetic(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        const_0: GoldilocksField,
+        const_1: GoldilocksField,
+        multiplicand_0: AssignedGoldilocksField,
+        multiplicand_1: AssignedGoldilocksField,
+        addend: AssignedGoldilocksField,
+    ) -> Result<AssignedGoldilocksField, Error> {
+        let tmp = self.mul(layouter.namespace(|| "mul"), multiplicand_0, multiplicand_1)?;
+        let left = self.constant_scalar_mul(layouter.namespace(|| "left scalar mul"), advice_column, const_0, tmp)?;
+        let right = self.constant_scalar_mul(layouter.namespace(|| "right scalar mul"), advice_column, const_1, addend)?;
+
+        self.add(layouter.namespace(|| "add"), advice_column, left, right)
     }
 }
 
@@ -549,11 +894,7 @@ impl AssignedGoldilocksExtension {
     }
 
     /// Constrain `a == b`.
-    pub fn connect(
-        &self,
-        mut layouter: impl Layouter<Fr>,
-        other: Self,
-    ) -> Result<(), Error> {
+    pub fn connect(&self, mut layouter: impl Layouter<Fr>, other: Self) -> Result<(), Error> {
         layouter.assign_region(
             || "constrain_equal self and other",
             |mut region| {
@@ -568,6 +909,625 @@ impl AssignedGoldilocksExtension {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct GoldilocksExtensionChip<F: FieldExt> {
+    pub range: RangeConfig<F>,
+}
+
+impl GoldilocksExtensionChip<Fr> {
+    pub fn construct(range_config: RangeConfig<Fr>) -> Self {
+        Self {
+            range: range_config,
+        }
+    }
+
+    // pub fn from_base_field(
+    //     &mut self,
+    //     mut layouter: impl Layouter<Fr>,
+    //     advice_column: Column<Advice>,
+    //     value: AssignedCell<Fr, Fr>,
+    // ) -> Result<AssignedGoldilocksExtension, Error> {
+    //     let zero = zero_assigned(layouter.namespace(|| "assign zero"), advice_column)?;
+
+    //     Ok(AssignedGoldilocksExtension([value, zero]))
+    // }
+
+    /// Constrain `output = a + b`.
+    pub fn add(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksExtension,
+        b: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let gate = self.range.gate();
+        let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
+        let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
+        let output0_assigned = RefCell::new(None);
+        let output1_assigned = RefCell::new(None);
+
+        layouter.assign_region(
+            || "assign a and b",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a0 = gate.load_witness(&mut ctx, a[0].value().and_then(|v| Value::known(*v)));
+                let a1 = gate.load_witness(&mut ctx, a[1].value().and_then(|v| Value::known(*v)));
+                *a_assigned.borrow_mut() = Some([a0, a1]);
+
+                let b0 = gate.load_witness(&mut ctx, b[0].value().and_then(|v| Value::known(*v)));
+                let b1 = gate.load_witness(&mut ctx, b[1].value().and_then(|v| Value::known(*v)));
+                *b_assigned.borrow_mut() = Some([b0, b1]);
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "copy a and b",
+            |mut region| {
+                region.constrain_equal(
+                    a_assigned.clone().into_inner().unwrap()[0].cell(),
+                    a[0].cell(),
+                )?;
+                region.constrain_equal(
+                    a_assigned.clone().into_inner().unwrap()[1].cell(),
+                    a[1].cell(),
+                )?;
+                region.constrain_equal(
+                    b_assigned.clone().into_inner().unwrap()[0].cell(),
+                    b[0].cell(),
+                )?;
+                region.constrain_equal(
+                    b_assigned.clone().into_inner().unwrap()[1].cell(),
+                    b[1].cell(),
+                )?;
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "assign zero extension",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a = a_assigned.borrow().clone().unwrap().clone();
+                let b = b_assigned.borrow().clone().unwrap().clone();
+                let a0 = QuantumCell::Existing(&a[0]);
+                let a1 = QuantumCell::Existing(&a[1]);
+                let b0 = QuantumCell::Existing(&b[0]);
+                let b1 = QuantumCell::Existing(&b[1]);
+
+                // output0 = a0 + b0
+                let output0 = gate.add(&mut ctx, a0, b0);
+                let output0 = AssignedCell::new(output0.value, output0.cell);
+                *output0_assigned.borrow_mut() = Some(output0);
+
+                // output1 = a1 + b1
+                let output1 = gate.add(&mut ctx, a1, b1);
+                let output1 = AssignedCell::new(output1.value, output1.cell);
+                *output1_assigned.borrow_mut() = Some(output1);
+
+                Ok(())
+            },
+        )?;
+
+        let output0 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output0 mod order"),
+            &self.range,
+            output0_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        let output1 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output1 mod order"),
+            &self.range,
+            output1_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        Ok(AssignedGoldilocksExtension([output0, output1]))
+    }
+
+    /// Constrain `output = -a`.
+    pub fn neg(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let gate = self.range.gate();
+        let a0 = mod_by_goldilocks_order(
+            layouter.namespace(|| "a0 mod order"),
+            &self.range,
+            a[0].clone(),
+        )
+        .unwrap();
+
+        let a1 = mod_by_goldilocks_order(
+            layouter.namespace(|| "a1 mod order"),
+            &self.range,
+            a[1].clone(),
+        )
+        .unwrap();
+
+        let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
+        let output0_assigned = RefCell::new(None);
+        let output1_assigned = RefCell::new(None);
+
+        layouter.assign_region(
+            || "assign a and b",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a0 = gate.load_witness(&mut ctx, a0.value().and_then(|v| Value::known(*v)));
+                let a1 = gate.load_witness(&mut ctx, a1.value().and_then(|v| Value::known(*v)));
+                *a_assigned.borrow_mut() = Some([a0, a1]);
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "copy a and b",
+            |mut region| {
+                region.constrain_equal(
+                    a_assigned.clone().into_inner().unwrap()[0].cell(),
+                    a[0].cell(),
+                )?;
+                region.constrain_equal(
+                    a_assigned.clone().into_inner().unwrap()[1].cell(),
+                    a[1].cell(),
+                )?;
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "assign zero extension",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a = a_assigned.borrow().clone().unwrap().clone();
+                let a0 = QuantumCell::Existing(&a[0]);
+                let a1 = QuantumCell::Existing(&a[1]);
+                let order = Fr::from(GOLDILOCKS_FIELD_ORDER); // the order of Goldilocks field
+                let order_assigned = gate.load_witness(&mut ctx, Value::known(order));
+
+                // output0 = order - a0
+                let output0 = gate.sub(&mut ctx, QuantumCell::Existing(&order_assigned), a0);
+                let output0 = AssignedCell::new(output0.value, output0.cell);
+                *output0_assigned.borrow_mut() = Some(output0);
+
+                // output1 = order - a1
+                let output1 = gate.sub(&mut ctx, QuantumCell::Existing(&order_assigned), a1);
+                let output1 = AssignedCell::new(output1.value, output1.cell);
+                *output1_assigned.borrow_mut() = Some(output1);
+
+                Ok(())
+            },
+        )?;
+
+        Ok(AssignedGoldilocksExtension([
+            output0_assigned.into_inner().unwrap(),
+            output1_assigned.into_inner().unwrap(),
+        ]))
+    }
+
+    pub fn sub(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksExtension,
+        b: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let minus_b = self.neg(layouter.namespace(|| "minus b"), b)?;
+
+        self.add(layouter.namespace(|| "add"), a, minus_b)
+    }
+
+    /// Constrain `output = a * b`.
+    pub fn mul(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksExtension,
+        b: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let gate = self.range.gate();
+        let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
+        let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
+        let output0_assigned = RefCell::new(None);
+        let output1_assigned = RefCell::new(None);
+
+        layouter.assign_region(
+            || "assign a and b",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a0 = gate.load_witness(&mut ctx, a[0].value().and_then(|v| Value::known(*v)));
+                let a1 = gate.load_witness(&mut ctx, a[1].value().and_then(|v| Value::known(*v)));
+                *a_assigned.borrow_mut() = Some([a0, a1]);
+
+                let b0 = gate.load_witness(&mut ctx, b[0].value().and_then(|v| Value::known(*v)));
+                let b1 = gate.load_witness(&mut ctx, b[1].value().and_then(|v| Value::known(*v)));
+                *b_assigned.borrow_mut() = Some([b0, b1]);
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "copy a and b",
+            |mut region| {
+                region.constrain_equal(
+                    a_assigned.clone().into_inner().unwrap()[0].cell(),
+                    a[0].cell(),
+                )?;
+                region.constrain_equal(
+                    a_assigned.clone().into_inner().unwrap()[1].cell(),
+                    a[1].cell(),
+                )?;
+                region.constrain_equal(
+                    b_assigned.clone().into_inner().unwrap()[0].cell(),
+                    b[0].cell(),
+                )?;
+                region.constrain_equal(
+                    b_assigned.clone().into_inner().unwrap()[1].cell(),
+                    b[1].cell(),
+                )?;
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "assign zero extension",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let a = a_assigned.borrow().clone().unwrap().clone();
+                let b = b_assigned.borrow().clone().unwrap().clone();
+                let a0 = QuantumCell::Existing(&a[0]);
+                let a1 = QuantumCell::Existing(&a[1]);
+                let b0 = QuantumCell::Existing(&b[0]);
+                let b1 = QuantumCell::Existing(&b[1]);
+
+                // output0 = a0 * b0 + W * a1 * b1
+                let w = Fr::from(7);
+                let w_assigned = gate.load_witness(&mut ctx, Value::known(w));
+                let tmp0 = gate.mul(&mut ctx, a0.clone(), b0.clone());
+                let tmp1 = gate.mul(&mut ctx, a1.clone(), b1.clone());
+                let tmp2 = gate.mul(
+                    &mut ctx,
+                    QuantumCell::Existing(&tmp1),
+                    QuantumCell::Existing(&w_assigned),
+                );
+                let output0 = gate.add(
+                    &mut ctx,
+                    QuantumCell::Existing(&tmp0),
+                    QuantumCell::Existing(&tmp2),
+                );
+                let output0 = AssignedCell::new(output0.value, output0.cell);
+                *output0_assigned.borrow_mut() = Some(output0);
+
+                // output1 = a0 * b1 + a1 * b0
+                let tmp0 = gate.mul(&mut ctx, a0, b1);
+                let tmp1 = gate.mul(&mut ctx, a1, b0);
+                let output1 = gate.add(
+                    &mut ctx,
+                    QuantumCell::Existing(&tmp0),
+                    QuantumCell::Existing(&tmp1),
+                );
+                let output1 = AssignedCell::new(output1.value, output1.cell);
+                *output1_assigned.borrow_mut() = Some(output1);
+
+                Ok(())
+            },
+        )?;
+
+        let output0 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output0 mod order"),
+            &self.range,
+            output0_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        let output1 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output0 mod order"),
+            &self.range,
+            output1_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        // let output0_cell = AssignedCell::new(output_assigned[0].value, output_assigned[0].cell);
+        // let output1_cell = AssignedCell::new(output_assigned[1].value, output_assigned[1].cell);
+
+        Ok(AssignedGoldilocksExtension([output0, output1]))
+    }
+
+    /// Constrain `output = a / b`.
+    pub fn div(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksExtension,
+        b: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let gate = self.range.gate();
+        let output = RefCell::new(None);
+
+        layouter.assign_region(
+            || "divide a into b",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let output_raw = a[0]
+                    .value()
+                    .zip(a[1].value())
+                    .zip(b[0].value())
+                    .zip(b[1].value())
+                    .map(|(((&a_0_raw, &a_1_raw), &b_0_raw), &b_1_raw)| {
+                        let a_raw = GoldilocksExtension([a_0_raw.into(), a_1_raw.into()]);
+                        let b_raw = GoldilocksExtension([b_0_raw.into(), b_1_raw.into()]);
+
+                        let output_raw = a_raw / b_raw;
+
+                        (*output_raw[0], *output_raw[1])
+                    });
+                let output_raw = output_raw.unzip();
+
+                let output0 = gate.load_witness(&mut ctx, output_raw.0);
+                let output1 = gate.load_witness(&mut ctx, output_raw.1);
+                let output0_assigned = AssignedCell::new(output0.value, output0.cell);
+                let output1_assigned = AssignedCell::new(output1.value, output1.cell);
+                let output_assigned =
+                    AssignedGoldilocksExtension([output0_assigned, output1_assigned]);
+                *output.borrow_mut() = Some(output_assigned);
+
+                Ok(())
+            },
+        )?;
+
+        let output_assigned = output.into_inner().unwrap();
+        let expected_a_assigned =
+            self.mul(layouter.namespace(|| "mul"), output_assigned.clone(), b)?;
+
+        layouter.assign_region(
+            || "constrain equal",
+            |mut region| {
+                region.constrain_equal(expected_a_assigned[0].cell(), a[0].cell())?;
+                region.constrain_equal(expected_a_assigned[1].cell(), a[1].cell())?;
+
+                Ok(())
+            },
+        )?;
+
+        Ok(output_assigned)
+    }
+
+    /// Constrain `output = a * b`.
+    pub fn square(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        a: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        self.mul(layouter.namespace(|| "mul"), a.clone(), a)
+    }
+
+    /// Constrain `output = a * scalar`.
+    pub fn constant_scalar_mul(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        scalar: Fr,
+        value: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let gate = self.range.gate();
+        let value_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
+        let output0_assigned = RefCell::new(None);
+        let output1_assigned = RefCell::new(None);
+
+        layouter.assign_region(
+            || "assign value",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let value0 =
+                    gate.load_witness(&mut ctx, value[0].value().and_then(|v| Value::known(*v)));
+                let value1 =
+                    gate.load_witness(&mut ctx, value[1].value().and_then(|v| Value::known(*v)));
+                *value_assigned.borrow_mut() = Some([value0, value1]);
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "copy value",
+            |mut region| {
+                region.constrain_equal(
+                    value_assigned.clone().into_inner().unwrap()[0].cell(),
+                    value[0].cell(),
+                )?;
+                region.constrain_equal(
+                    value_assigned.clone().into_inner().unwrap()[1].cell(),
+                    value[1].cell(),
+                )?;
+
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "assign zero extension",
+            |region| {
+                let mut ctx = Context::new(
+                    region,
+                    ContextParams {
+                        max_rows: gate.max_rows,
+                        num_context_ids: 1,
+                        fixed_columns: gate.constants.clone(),
+                    },
+                );
+
+                let scalar_assigned = gate.load_witness(&mut ctx, Value::known(scalar));
+                let a = value_assigned.borrow().clone().unwrap().clone();
+
+                // output0 = a0 * scalar
+                let output0 = gate.mul(
+                    &mut ctx,
+                    QuantumCell::Existing(&a[0]),
+                    QuantumCell::Existing(&scalar_assigned),
+                );
+                let output0 = AssignedCell::new(output0.value, output0.cell);
+                *output0_assigned.borrow_mut() = Some(output0);
+
+                // output0 = a1 * scalar
+                let output1 = gate.mul(
+                    &mut ctx,
+                    QuantumCell::Existing(&a[1]),
+                    QuantumCell::Existing(&scalar_assigned),
+                );
+                let output1 = AssignedCell::new(output1.value, output1.cell);
+                *output1_assigned.borrow_mut() = Some(output1);
+
+                Ok(())
+            },
+        )?;
+
+        let output0 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output0 mod order"),
+            &self.range,
+            output0_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        let output1 = mod_by_goldilocks_order(
+            layouter.namespace(|| "output1 mod order"),
+            &self.range,
+            output1_assigned.into_inner().unwrap(),
+        )
+        .unwrap();
+
+        Ok(AssignedGoldilocksExtension([output0, output1]))
+    }
+
+    pub fn scalar_mul(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        scalar: AssignedCell<Fr, Fr>,
+        value: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let zero = zero_assigned(layouter.namespace(|| "assign zero"), advice_column).unwrap();
+        let b = AssignedGoldilocksExtension([scalar, zero]);
+
+        self.mul(layouter.namespace(|| "mul"), value, b)
+    }
+
+    /// Constrain `output = constant0 * multiplicand0 * multiplicand1 + constant1 * addend`.
+    pub fn arithmetic(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        constant0: Fr,
+        constant1: Fr,
+        multiplicand0: AssignedGoldilocksExtension,
+        multiplicand1: AssignedGoldilocksExtension,
+        addend: AssignedGoldilocksExtension,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let tmp0 = self.mul(
+            layouter.namespace(|| "multiplication"),
+            multiplicand0,
+            multiplicand1,
+        )?;
+        let tmp0 =
+            self.constant_scalar_mul(layouter.namespace(|| "first term"), constant0, tmp0)?;
+        let tmp1 =
+            self.constant_scalar_mul(layouter.namespace(|| "second term"), constant1, addend)?;
+
+        self.add(layouter.namespace(|| "add"), tmp0, tmp1)
+    }
+
+    pub fn exp_u64(
+        &self,
+        mut layouter: impl Layouter<Fr>,
+        advice_column: Column<Advice>,
+        base: AssignedGoldilocksExtension,
+        power: u64,
+    ) -> Result<AssignedGoldilocksExtension, Error> {
+        let mut current = base;
+        let mut product = AssignedGoldilocksExtension::constant(
+            layouter.namespace(|| "assign one"),
+            advice_column,
+            GoldilocksExtension([Fr::one().into(), Fr::zero().into()]),
+        )?;
+
+        for j in 0..bits_u64(power) {
+            if j != 0 {
+                current = self.square(layouter.namespace(|| "square"), current.clone())?;
+            }
+            if (power >> j & 1) != 0 {
+                product = self.mul(layouter.namespace(|| "mul"), product, current.clone())?;
+            }
+        }
+
+        Ok(product)
+    }
+}
+
 pub fn from_base_field(
     mut layouter: impl Layouter<Fr>,
     advice_column: Column<Advice>,
@@ -576,566 +1536,6 @@ pub fn from_base_field(
     let zero = zero_assigned(layouter.namespace(|| "assign zero"), advice_column)?;
 
     Ok(AssignedGoldilocksExtension([value, zero]))
-}
-
-const K: usize = 12;
-
-/// Constrain `output = a + b`.
-pub fn add_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    a: AssignedGoldilocksExtension,
-    b: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let gate = range.gate();
-    let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    let output0_assigned = RefCell::new(None);
-    let output1_assigned = RefCell::new(None);
-
-    layouter.assign_region(
-        || "assign a and b",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let a0 = gate.load_witness(&mut ctx, a[0].value().and_then(|v| Value::known(*v)));
-            let a1 = gate.load_witness(&mut ctx, a[1].value().and_then(|v| Value::known(*v)));
-            *a_assigned.borrow_mut() = Some([a0, a1]);
-
-            let b0 = gate.load_witness(&mut ctx, b[0].value().and_then(|v| Value::known(*v)));
-            let b1 = gate.load_witness(&mut ctx, b[1].value().and_then(|v| Value::known(*v)));
-            *b_assigned.borrow_mut() = Some([b0, b1]);
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "copy a and b",
-        |mut region| {
-            region.constrain_equal(
-                a_assigned.clone().into_inner().unwrap()[0].cell(),
-                a[0].cell(),
-            )?;
-            region.constrain_equal(
-                a_assigned.clone().into_inner().unwrap()[1].cell(),
-                a[1].cell(),
-            )?;
-            region.constrain_equal(
-                b_assigned.clone().into_inner().unwrap()[0].cell(),
-                b[0].cell(),
-            )?;
-            region.constrain_equal(
-                b_assigned.clone().into_inner().unwrap()[1].cell(),
-                b[1].cell(),
-            )?;
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "assign zero extension",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let a = a_assigned.borrow().clone().unwrap().clone();
-            let b = b_assigned.borrow().clone().unwrap().clone();
-            let a0 = QuantumCell::Existing(&a[0]);
-            let a1 = QuantumCell::Existing(&a[1]);
-            let b0 = QuantumCell::Existing(&b[0]);
-            let b1 = QuantumCell::Existing(&b[1]);
-
-            // output0 = a0 + b0
-            let output0 = gate.add(&mut ctx, a0, b0);
-            let output0 = AssignedCell::new(output0.value, output0.cell);
-            *output0_assigned.borrow_mut() = Some(output0);
-
-            // output1 = a1 + b1
-            let output1 = gate.add(&mut ctx, a1, b1);
-            let output1 = AssignedCell::new(output1.value, output1.cell);
-            *output1_assigned.borrow_mut() = Some(output1);
-
-            Ok(())
-        },
-    )?;
-
-    let output0 = mod_by_goldilocks_order(
-        layouter.namespace(|| "output0 mod order"),
-        range,
-        output0_assigned.into_inner().unwrap(),
-    )
-    .unwrap();
-
-    let output1 = mod_by_goldilocks_order(
-        layouter.namespace(|| "output1 mod order"),
-        range,
-        output1_assigned.into_inner().unwrap(),
-    )
-    .unwrap();
-
-    Ok(AssignedGoldilocksExtension([output0, output1]))
-}
-
-/// Constrain `output = -a`.
-pub fn neg_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    a: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let gate = range.gate();
-    let a0 = mod_by_goldilocks_order(layouter.namespace(|| "a0 mod order"), range, a[0].clone())
-        .unwrap();
-
-    let a1 = mod_by_goldilocks_order(layouter.namespace(|| "a1 mod order"), range, a[1].clone())
-        .unwrap();
-
-    let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    let output0_assigned = RefCell::new(None);
-    let output1_assigned = RefCell::new(None);
-
-    layouter.assign_region(
-        || "assign a and b",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let a0 = gate.load_witness(&mut ctx, a0.value().and_then(|v| Value::known(*v)));
-            let a1 = gate.load_witness(&mut ctx, a1.value().and_then(|v| Value::known(*v)));
-            *a_assigned.borrow_mut() = Some([a0, a1]);
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "copy a and b",
-        |mut region| {
-            region.constrain_equal(
-                a_assigned.clone().into_inner().unwrap()[0].cell(),
-                a[0].cell(),
-            )?;
-            region.constrain_equal(
-                a_assigned.clone().into_inner().unwrap()[1].cell(),
-                a[1].cell(),
-            )?;
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "assign zero extension",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let a = a_assigned.borrow().clone().unwrap().clone();
-            let a0 = QuantumCell::Existing(&a[0]);
-            let a1 = QuantumCell::Existing(&a[1]);
-            let order = Fr::from(GOLDILOCKS_FIELD_ORDER); // the order of Goldilocks field
-            let order_assigned = gate.load_witness(&mut ctx, Value::known(order));
-
-            // output0 = order - a0
-            let output0 = gate.sub(&mut ctx, QuantumCell::Existing(&order_assigned), a0);
-            let output0 = AssignedCell::new(output0.value, output0.cell);
-            *output0_assigned.borrow_mut() = Some(output0);
-
-            // output1 = order - a1
-            let output1 = gate.sub(&mut ctx, QuantumCell::Existing(&order_assigned), a1);
-            let output1 = AssignedCell::new(output1.value, output1.cell);
-            *output1_assigned.borrow_mut() = Some(output1);
-
-            Ok(())
-        },
-    )?;
-
-    Ok(AssignedGoldilocksExtension([
-        output0_assigned.into_inner().unwrap(),
-        output1_assigned.into_inner().unwrap(),
-    ]))
-}
-
-/// Constrain `output = a * b`.
-pub fn mul_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    a: AssignedGoldilocksExtension,
-    b: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let gate = range.gate();
-    let a_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    let b_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    let output0_assigned = RefCell::new(None);
-    let output1_assigned = RefCell::new(None);
-
-    layouter.assign_region(
-        || "assign a and b",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let a0 = gate.load_witness(&mut ctx, a[0].value().and_then(|v| Value::known(*v)));
-            let a1 = gate.load_witness(&mut ctx, a[1].value().and_then(|v| Value::known(*v)));
-            *a_assigned.borrow_mut() = Some([a0, a1]);
-
-            let b0 = gate.load_witness(&mut ctx, b[0].value().and_then(|v| Value::known(*v)));
-            let b1 = gate.load_witness(&mut ctx, b[1].value().and_then(|v| Value::known(*v)));
-            *b_assigned.borrow_mut() = Some([b0, b1]);
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "copy a and b",
-        |mut region| {
-            region.constrain_equal(
-                a_assigned.clone().into_inner().unwrap()[0].cell(),
-                a[0].cell(),
-            )?;
-            region.constrain_equal(
-                a_assigned.clone().into_inner().unwrap()[1].cell(),
-                a[1].cell(),
-            )?;
-            region.constrain_equal(
-                b_assigned.clone().into_inner().unwrap()[0].cell(),
-                b[0].cell(),
-            )?;
-            region.constrain_equal(
-                b_assigned.clone().into_inner().unwrap()[1].cell(),
-                b[1].cell(),
-            )?;
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "assign zero extension",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let a = a_assigned.borrow().clone().unwrap().clone();
-            let b = b_assigned.borrow().clone().unwrap().clone();
-            let a0 = QuantumCell::Existing(&a[0]);
-            let a1 = QuantumCell::Existing(&a[1]);
-            let b0 = QuantumCell::Existing(&b[0]);
-            let b1 = QuantumCell::Existing(&b[1]);
-
-            // output0 = a0 * b0 + W * a1 * b1
-            let w = Fr::from(7);
-            let w_assigned = gate.load_witness(&mut ctx, Value::known(w));
-            let tmp0 = gate.mul(&mut ctx, a0.clone(), b0.clone());
-            let tmp1 = gate.mul(&mut ctx, a1.clone(), b1.clone());
-            let tmp2 = gate.mul(
-                &mut ctx,
-                QuantumCell::Existing(&tmp1),
-                QuantumCell::Existing(&w_assigned),
-            );
-            let output0 = gate.add(
-                &mut ctx,
-                QuantumCell::Existing(&tmp0),
-                QuantumCell::Existing(&tmp2),
-            );
-            let output0 = AssignedCell::new(output0.value, output0.cell);
-            *output0_assigned.borrow_mut() = Some(output0);
-
-            // output1 = a0 * b1 + a1 * b0
-            let tmp0 = gate.mul(&mut ctx, a0, b1);
-            let tmp1 = gate.mul(&mut ctx, a1, b0);
-            let output1 = gate.add(
-                &mut ctx,
-                QuantumCell::Existing(&tmp0),
-                QuantumCell::Existing(&tmp1),
-            );
-            let output1 = AssignedCell::new(output1.value, output1.cell);
-            *output1_assigned.borrow_mut() = Some(output1);
-
-            Ok(())
-        },
-    )?;
-
-    let output0 = mod_by_goldilocks_order(
-        layouter.namespace(|| "output0 mod order"),
-        range,
-        output0_assigned.into_inner().unwrap(),
-    )
-    .unwrap();
-
-    let output1 = mod_by_goldilocks_order(
-        layouter.namespace(|| "output0 mod order"),
-        range,
-        output1_assigned.into_inner().unwrap(),
-    )
-    .unwrap();
-
-    // let output0_cell = AssignedCell::new(output_assigned[0].value, output_assigned[0].cell);
-    // let output1_cell = AssignedCell::new(output_assigned[1].value, output_assigned[1].cell);
-
-    Ok(AssignedGoldilocksExtension([output0, output1]))
-}
-
-/// Constrain `output = a / b`.
-pub fn div_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    a: AssignedGoldilocksExtension,
-    b: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let gate = range.gate();
-    let output = RefCell::new(None);
-
-    layouter.assign_region(
-        || "divide a into b",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let output_raw = a[0]
-                .value()
-                .zip(a[1].value())
-                .zip(b[0].value())
-                .zip(b[1].value())
-                .map(|(((&a_0_raw, &a_1_raw), &b_0_raw), &b_1_raw)| {
-                    let a_raw = GoldilocksExtension([a_0_raw.into(), a_1_raw.into()]);
-                    let b_raw = GoldilocksExtension([b_0_raw.into(), b_1_raw.into()]);
-
-                    let output_raw = a_raw / b_raw;
-
-                    (*output_raw[0], *output_raw[1])
-                });
-            let output_raw = output_raw.unzip();
-
-            let output0 = gate.load_witness(&mut ctx, output_raw.0);
-            let output1 = gate.load_witness(&mut ctx, output_raw.1);
-            let output0_assigned = AssignedCell::new(output0.value, output0.cell);
-            let output1_assigned = AssignedCell::new(output1.value, output1.cell);
-            let output_assigned = AssignedGoldilocksExtension([output0_assigned, output1_assigned]);
-            *output.borrow_mut() = Some(output_assigned);
-
-            Ok(())
-        },
-    )?;
-
-    let output_assigned = output.into_inner().unwrap();
-    let expected_a_assigned = mul_extension(
-        layouter.namespace(|| "mul"),
-        range,
-        output_assigned.clone(),
-        b,
-    )?;
-
-    layouter.assign_region(
-        || "constrain equal",
-        |mut region| {
-            region.constrain_equal(expected_a_assigned[0].cell(), a[0].cell())?;
-            region.constrain_equal(expected_a_assigned[1].cell(), a[1].cell())?;
-
-            Ok(())
-        },
-    )?;
-
-    Ok(output_assigned)
-}
-
-/// Constrain `output = a * b`.
-pub fn square_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    a: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    mul_extension(layouter.namespace(|| "mul"), range, a.clone(), a)
-}
-
-/// Constrain `output = a * scalar`.
-pub fn constant_scalar_mul_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    scalar: Fr,
-    value: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let gate = range.gate();
-    let value_assigned: RefCell<Option<[AssignedValue<Fr>; 2]>> = RefCell::new(None);
-    let output0_assigned = RefCell::new(None);
-    let output1_assigned = RefCell::new(None);
-
-    layouter.assign_region(
-        || "assign value",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let value0 =
-                gate.load_witness(&mut ctx, value[0].value().and_then(|v| Value::known(*v)));
-            let value1 =
-                gate.load_witness(&mut ctx, value[1].value().and_then(|v| Value::known(*v)));
-            *value_assigned.borrow_mut() = Some([value0, value1]);
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "copy value",
-        |mut region| {
-            region.constrain_equal(
-                value_assigned.clone().into_inner().unwrap()[0].cell(),
-                value[0].cell(),
-            )?;
-            region.constrain_equal(
-                value_assigned.clone().into_inner().unwrap()[1].cell(),
-                value[1].cell(),
-            )?;
-
-            Ok(())
-        },
-    )?;
-
-    layouter.assign_region(
-        || "assign zero extension",
-        |region| {
-            let mut ctx = Context::new(
-                region,
-                ContextParams {
-                    max_rows: 1 << K,
-                    num_context_ids: 1,
-                    fixed_columns: gate.constants.clone(),
-                },
-            );
-
-            let scalar_assigned = gate.load_witness(&mut ctx, Value::known(scalar));
-            let a = value_assigned.borrow().clone().unwrap().clone();
-
-            // output0 = a0 * scalar
-            let output0 = gate.mul(
-                &mut ctx,
-                QuantumCell::Existing(&a[0]),
-                QuantumCell::Existing(&scalar_assigned),
-            );
-            let output0 = AssignedCell::new(output0.value, output0.cell);
-            *output0_assigned.borrow_mut() = Some(output0);
-
-            // output0 = a1 * scalar
-            let output1 = gate.mul(
-                &mut ctx,
-                QuantumCell::Existing(&a[1]),
-                QuantumCell::Existing(&scalar_assigned),
-            );
-            let output1 = AssignedCell::new(output1.value, output1.cell);
-            *output1_assigned.borrow_mut() = Some(output1);
-
-            Ok(())
-        },
-    )?;
-
-    let output0 = mod_by_goldilocks_order(
-        layouter.namespace(|| "output0 mod order"),
-        range,
-        output0_assigned.into_inner().unwrap(),
-    )
-    .unwrap();
-
-    let output1 = mod_by_goldilocks_order(
-        layouter.namespace(|| "output1 mod order"),
-        range,
-        output1_assigned.into_inner().unwrap(),
-    )
-    .unwrap();
-
-    Ok(AssignedGoldilocksExtension([output0, output1]))
-}
-
-pub fn scalar_mul_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    advice_column: Column<Advice>,
-    scalar: AssignedCell<Fr, Fr>,
-    value: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let zero = zero_assigned(layouter.namespace(|| "assign zero"), advice_column).unwrap();
-    let b = AssignedGoldilocksExtension([scalar, zero]);
-
-    mul_extension(layouter, range, value, b)
-}
-
-/// Constrain `output = constant0 * multiplicand0 * multiplicand1 + constant1 * addend`.
-pub fn arithmetic_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    constant0: Fr,
-    constant1: Fr,
-    multiplicand0: AssignedGoldilocksExtension,
-    multiplicand1: AssignedGoldilocksExtension,
-    addend: AssignedGoldilocksExtension,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let tmp0 = mul_extension(
-        layouter.namespace(|| "multiplication"),
-        range,
-        multiplicand0,
-        multiplicand1,
-    )?;
-    let tmp0 =
-        constant_scalar_mul_extension(layouter.namespace(|| "first term"), range, constant0, tmp0)?;
-    let tmp1 = constant_scalar_mul_extension(
-        layouter.namespace(|| "second term"),
-        range,
-        constant1,
-        addend,
-    )?;
-
-    add_extension(layouter, range, tmp0, tmp1)
 }
 
 /// Constrain `output = a % GOLDILOCKS_FIELD_ORDER`.
@@ -1154,7 +1554,7 @@ pub fn mod_by_goldilocks_order(
             let mut ctx = Context::new(
                 region,
                 ContextParams {
-                    max_rows: 1 << K,
+                    max_rows: gate.max_rows,
                     num_context_ids: 1,
                     fixed_columns: gate.constants.clone(),
                 },
@@ -1182,7 +1582,7 @@ pub fn mod_by_goldilocks_order(
             let mut ctx = Context::new(
                 region,
                 ContextParams {
-                    max_rows: 1 << K,
+                    max_rows: gate.max_rows,
                     num_context_ids: 1,
                     fixed_columns: gate.constants.clone(),
                 },
@@ -1248,37 +1648,6 @@ pub fn mod_by_goldilocks_order(
     Ok(output_cell)
 }
 
-pub fn exp_u64_extension(
-    mut layouter: impl Layouter<Fr>,
-    range: &RangeConfig<Fr>,
-    advice_column: Column<Advice>,
-    base: AssignedGoldilocksExtension,
-    power: u64,
-) -> Result<AssignedGoldilocksExtension, Error> {
-    let mut current = base;
-    let mut product = AssignedGoldilocksExtension::constant(
-        layouter.namespace(|| "assign one"),
-        advice_column,
-        GoldilocksExtension([Fr::one().into(), Fr::zero().into()]),
-    )?;
-
-    for j in 0..bits_u64(power) {
-        if j != 0 {
-            current = square_extension(layouter.namespace(|| "square"), range, current.clone())?;
-        }
-        if (power >> j & 1) != 0 {
-            product = mul_extension(
-                layouter.namespace(|| "mul"),
-                range,
-                product,
-                current.clone(),
-            )?;
-        }
-    }
-
-    Ok(product)
-}
-
 pub fn simple_constraints(
     mut layouter: impl Layouter<Fr>,
     gate: &FlexGateConfig<Fr>,
@@ -1294,7 +1663,7 @@ pub fn simple_constraints(
             let mut ctx = Context::new(
                 region,
                 ContextParams {
-                    max_rows: 1 << K,
+                    max_rows: gate.max_rows,
                     num_context_ids: 1,
                     fixed_columns: gate.constants.clone(),
                 },
@@ -1331,6 +1700,8 @@ mod tests {
 
     use super::*;
 
+    const K: usize = 12;
+
     #[derive(Clone)]
     pub struct MyConfig {
         a: Column<Advice>,
@@ -1356,10 +1727,9 @@ mod tests {
 
             let range =
                 RangeConfig::configure(meta, RangeStrategy::Vertical, &[1], &[0], 1, 15, 0, K); // 10k bytes
-                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[2], &[1], 1, 15, 0, K); // 15k bytes
-                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[1], &[6], 1, 15, 0, K); // invalid circuit
-                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[5], &[6], 1, 15, 0, K); // exceed code size
-
+                                                                                                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[2], &[1], 1, 15, 0, K); // 15k bytes
+                                                                                                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[1], &[6], 1, 15, 0, K); // invalid circuit
+                                                                                                // RangeConfig::configure(meta, RangeStrategy::Vertical, &[5], &[6], 1, 15, 0, K); // exceed code size
 
             Self::Config { a, range }
         }
@@ -1369,7 +1739,6 @@ mod tests {
             config: Self::Config,
             mut layouter: impl Layouter<Fr>,
         ) -> Result<(), Error> {
-            let range = &config.range;
             let a = config.a;
 
             let value00 = Fr::from(1);
@@ -1390,10 +1759,11 @@ mod tests {
                 [value10.into(), value11.into()].into(),
             )?;
 
+            let mut ge_chip = GoldilocksExtensionChip::construct(config.range);
+
             // [181, 38] = 3 * [1, 2] * [3, 4] + 4 * [1, 2] = 3 * [59, 10] + [4, 8] = [177, 30] + [4, 8]
-            let output_assigned = arithmetic_extension(
-                layouter,
-                range,
+            let output_assigned = ge_chip.arithmetic(
+                layouter.namespace(|| "arithmetic"),
                 value10,
                 value11,
                 value0.clone(),

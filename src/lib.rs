@@ -3,6 +3,7 @@
 
 pub mod field;
 pub mod fri;
+mod interpolation;
 mod map_to_curve;
 mod merkle_tree;
 // mod merkle_tree_circuit;

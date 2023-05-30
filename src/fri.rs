@@ -11,22 +11,14 @@ use halo2_base::{
         plonk::{Advice, Circuit, Column, ConstraintSystem, Error},
     },
 };
-use plonky2::{
-    // field::{
-    //     extension::quadratic::QuadraticExtension,
-    //     goldilocks_field::GoldilocksField as GoldilocksFieldOriginal,
-    //     types::{Field, PrimeField},
-    // },
-    fri::FriParams,
-    // util::{bits_u64, reverse_index_bits_in_place},
-};
+use plonky2::fri::FriParams;
 use poseidon_circuit::poseidon::{primitives::P128Pow5T3, Pow5Chip, Pow5Config};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     field::{
-        add_extension, div_extension, from_base_field, neg_extension, zero_assigned,
-        AssignedGoldilocksExtension, AssignedGoldilocksField, GoldilocksExtension, GoldilocksField,
+        from_base_field, zero_assigned, AssignedGoldilocksExtension, AssignedGoldilocksField,
+        GoldilocksExtension, GoldilocksExtensionChip, GoldilocksField,
     },
     reducing::{AssignedReducingFactor, ReducingFactor},
 };
@@ -415,7 +407,8 @@ pub fn fri_combine_initial_assigned(
 ) -> Result<AssignedGoldilocksExtension, Error> {
     let zero = zero_assigned(layouter.namespace(|| "assign zero"), advice_column)?;
     let subgroup_x = AssignedGoldilocksExtension([subgroup_x.0, zero]);
-    let mut alpha = AssignedReducingFactor::new(alpha);
+    let ge_chip = GoldilocksExtensionChip::construct(range.clone());
+    let mut alpha = AssignedReducingFactor::new(ge_chip.clone(), alpha);
     let mut sum = AssignedGoldilocksExtension::zero(
         layouter.namespace(|| "assign zero extension"),
         advice_column,
@@ -440,41 +433,21 @@ pub fn fri_combine_initial_assigned(
                     layouter.namespace(|| "from base field"),
                     advice_column,
                     value.0,
-                )
-                .unwrap()
+                ).unwrap()
             })
             .collect::<Vec<_>>();
-        let reduced_evals = alpha.reduce(
-            layouter.namespace(|| "reduce"),
-            range,
-            advice_column,
-            &evals,
-        );
-        let tmp = neg_extension(
-            layouter.namespace(|| "neg1"),
-            range,
-            reduced_openings.clone(),
-        )
-        .unwrap();
-        let numerator =
-            add_extension(layouter.namespace(|| "add1"), range, reduced_evals, tmp).unwrap();
-        let tmp = neg_extension(layouter.namespace(|| "neg2"), range, point.clone()).unwrap();
-        let denominator = add_extension(
-            layouter.namespace(|| "add2"),
-            range,
-            subgroup_x.clone(),
-            tmp,
-        )
-        .unwrap();
+        let reduced_evals = alpha.reduce(layouter.namespace(|| "reduce"), advice_column, &evals)?;
+        let tmp = ge_chip.neg(layouter.namespace(|| "neg1"), reduced_openings.clone())?;
+        let numerator = ge_chip.add(layouter.namespace(|| "add1"), reduced_evals, tmp)?;
+        let tmp = ge_chip.neg(layouter.namespace(|| "neg2"), point.clone())?;
+        let denominator = ge_chip.add(layouter.namespace(|| "add2"), subgroup_x.clone(), tmp)?;
         sum = alpha.shift(
             layouter.namespace(|| "shift alpha by sum"),
-            range,
             advice_column,
             sum,
-        );
-        let tmp =
-            div_extension(layouter.namespace(|| "div"), range, numerator, denominator).unwrap();
-        sum = add_extension(layouter.namespace(|| "add"), range, sum, tmp).unwrap();
+        )?;
+        let tmp = ge_chip.div(layouter.namespace(|| "div"), numerator, denominator)?;
+        sum = ge_chip.add(layouter.namespace(|| "add"), sum, tmp)?;
     }
 
     Ok(sum)
@@ -566,12 +539,12 @@ mod tests {
         ) -> Self::Config {
             let state = (0..WIDTH).map(|_| meta.advice_column()).collect::<Vec<_>>();
             let partial_sbox = meta.advice_column();
-    
+
             let rc_a = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
             let rc_b = (0..WIDTH).map(|_| meta.fixed_column()).collect::<Vec<_>>();
-    
+
             meta.enable_constant(rc_b[0]);
-    
+
             let poseidon = Pow5Chip::configure::<P128Pow5T3<Fr>>(
                 meta,
                 state.try_into().unwrap(),
