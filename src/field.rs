@@ -134,7 +134,6 @@ fn test_inv() {
     let one = GoldilocksField::from(Fr::one());
     let a = GoldilocksField::from(Fr::from(0x7fffffff80000001));
     let inv_a = a.inv();
-    dbg!(inv_a);
     assert_eq!(a * inv_a, one);
 }
 
@@ -226,7 +225,7 @@ impl AssignedGoldilocksField {
     ) -> Result<Self, Error> {
         let zero = GoldilocksField::from(Fr::zero());
 
-        Self::constant(layouter, advice_column, zero)
+        Self::constant(layouter.namespace(|| "assign zero"), advice_column, zero)
     }
 
     pub fn one(
@@ -235,7 +234,7 @@ impl AssignedGoldilocksField {
     ) -> Result<Self, Error> {
         let one = GoldilocksField::from(Fr::one());
 
-        Self::constant(layouter, advice_column, one)
+        Self::constant(layouter.namespace(|| "assign one"), advice_column, one)
     }
 
     pub fn constant(
@@ -282,7 +281,6 @@ impl GoldilocksFieldChip<Fr> {
     pub fn add(
         &self,
         mut layouter: impl Layouter<Fr>,
-        advice_column: Column<Advice>,
         a: AssignedGoldilocksField,
         b: AssignedGoldilocksField,
     ) -> Result<AssignedGoldilocksField, Error> {
@@ -424,9 +422,7 @@ impl GoldilocksFieldChip<Fr> {
                 let a0 = QuantumCell::Existing(&a);
                 let b0 = QuantumCell::Existing(&b);
 
-                // output0 = a0 * b0 + W * a1 * b1
-                let w = Fr::from(7);
-                let w_assigned = gate.load_witness(&mut ctx, Value::known(w));
+                // output0 = a0 * b0
                 let output0 = gate.mul(&mut ctx, a0.clone(), b0.clone());
                 let output0 = AssignedCell::new(output0.value, output0.cell);
                 *output0_assigned.borrow_mut() = Some(output0);
@@ -539,7 +535,7 @@ impl GoldilocksFieldChip<Fr> {
         let left = self.constant_scalar_mul(layouter.namespace(|| "left scalar mul"), advice_column, const_0, tmp)?;
         let right = self.constant_scalar_mul(layouter.namespace(|| "right scalar mul"), advice_column, const_1, addend)?;
 
-        self.add(layouter.namespace(|| "add"), advice_column, left, right)
+        self.add(layouter.namespace(|| "add"), left, right)
     }
 }
 
@@ -1759,7 +1755,7 @@ mod tests {
                 [value10.into(), value11.into()].into(),
             )?;
 
-            let mut ge_chip = GoldilocksExtensionChip::construct(config.range);
+            let ge_chip = GoldilocksExtensionChip::construct(config.range);
 
             // [181, 38] = 3 * [1, 2] * [3, 4] + 4 * [1, 2] = 3 * [59, 10] + [4, 8] = [177, 30] + [4, 8]
             let output_assigned = ge_chip.arithmetic(
